@@ -35,7 +35,7 @@ jobs:
 
       - name: Smoke test
         env:
-          BASE_URL: ${{ vars.BASE_URL || 'https://jobrunr-docs-mcp.fly.dev' }}
+          BASE_URL: ${{ vars.BASE_URL || 'https://mcp.jobrunr.io' }}
         run: |
           for i in 1 2 3 4 5 6; do
             if curl -fsS "$BASE_URL/actuator/health" | grep -q '"status":"UP"'; then

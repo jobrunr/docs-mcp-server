@@ -4,7 +4,7 @@ Hosted [Model Context Protocol](https://modelcontextprotocol.io) server that exp
 
 Add one URL to your IDE config and JobRunr docs are live in every conversation — your agent stops hallucinating APIs and starts citing real `jobrunr.io` pages.
 
-**Live endpoint:** `https://jobrunr-docs-mcp.fly.dev/mcp` (until DNS for `mcp.jobrunr.io` is wired)
+**Live endpoint:** `https://mcp.jobrunr.io/mcp`
 
 Built on Spring Boot 4.1 + Spring AI 2.0's MCP server starter + Apache Lucene (BM25) + a local ONNX MiniLM embedding model. Retrieval is hybrid: BM25 and semantic search combined via Reciprocal Rank Fusion.
 
@@ -43,7 +43,7 @@ The `form: "mcp-trial"` field is hardcoded server-side so n8n can route MCP-sour
 ### Claude Code
 
 ```
-claude mcp add --transport http jobrunr-docs https://jobrunr-docs-mcp.fly.dev/mcp
+claude mcp add --transport http jobrunr-docs https://mcp.jobrunr.io/mcp
 ```
 
 Restart Claude Code, then ask about anything JobRunr-related. Run `/mcp` inside Claude Code to confirm the connection.
@@ -59,7 +59,7 @@ Add to `~/.cursor/mcp.json`:
 {
   "mcpServers": {
     "jobrunr-docs": {
-      "url": "https://jobrunr-docs-mcp.fly.dev/mcp"
+      "url": "https://mcp.jobrunr.io/mcp"
     }
   }
 }
@@ -69,24 +69,24 @@ Restart Cursor. Tools appear under Settings → MCP.
 
 ### VS Code / Windsurf / others
 
-Use the same URL — `https://jobrunr-docs-mcp.fly.dev/mcp` — with whatever MCP config the client expects. Most accept a one-line `url` entry.
+Use the same URL — `https://mcp.jobrunr.io/mcp` — with whatever MCP config the client expects. Most accept a one-line `url` entry.
 
 ### MCP Inspector (debugging)
 
 ```
-npx @modelcontextprotocol/inspector --cli https://jobrunr-docs-mcp.fly.dev/mcp --transport http --method tools/list
+npx @modelcontextprotocol/inspector --cli https://mcp.jobrunr.io/mcp --transport http --method tools/list
 ```
 
-Or drop the `--cli …` flags for the browser UI: transport = **Streamable HTTP**, URL = **`https://jobrunr-docs-mcp.fly.dev/mcp`**, click Connect.
+Or drop the `--cli …` flags for the browser UI: transport = **Streamable HTTP**, URL = **`https://mcp.jobrunr.io/mcp`**, click Connect.
 
 ### Raw curl
 
 ```bash
-curl https://jobrunr-docs-mcp.fly.dev/actuator/health
+curl https://mcp.jobrunr.io/actuator/health
 # {"status":"UP",...}
 
 # Full JSON-RPC handshake — this is exactly what a client's first request looks like:
-curl -X POST https://jobrunr-docs-mcp.fly.dev/mcp \
+curl -X POST https://mcp.jobrunr.io/mcp \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
   -H 'MCP-Protocol-Version: 2025-11-25' \
@@ -193,22 +193,21 @@ The JobRunr website's GitHub Actions deploy step builds these automatically (see
 
 These are deliberate shortcuts taken to get the server live for testing. Track these before opening it up.
 
-1. **Flip `DOCS_URL` back to the canonical website path.** Currently bootstrapped to
-   `raw.githubusercontent.com/iNicholasBE/jobrunr-docs-mcp/main/data/docs.json` because the Hugo workflow that publishes
-   `https://www.jobrunr.io/mcp/docs.json` hasn't been merged/deployed yet. Once the JobRunr website repo ships those
-   artifacts, edit `fly.toml`'s `[env]` block to point at `https://www.jobrunr.io/mcp/docs.json` and
-   `https://www.jobrunr.io/mcp/manifest.json`, then `flyctl deploy`. Delete `data/docs.json` and `data/manifest.json`
-   from this repo afterwards.
+1. ~~**Flip `DOCS_URL` back to the canonical website path.**~~ Done — the server loads from
+   `https://www.jobrunr.io/mcp/docs.json`. The stale `data/docs.json` and `data/manifest.json` copies are still in
+   this repo though; they're only used as local dev fixtures now and can be deleted.
 2. **Wire up `MCP_REINDEX_SECRET`.** Generate a long random value and set it on both sides:
    - `flyctl secrets set MCP_REINDEX_SECRET=<value> -a jobrunr-docs-mcp`
    - GitHub repo `jobrunr/jobrunr.io` (or wherever the website lives) → Settings → Secrets → `MCP_REINDEX_SECRET = <same value>`
    - The Hugo deploy workflow will then push fresh docs to the server immediately on each website deploy, instead of
      waiting up to 15 minutes for the scheduled poll.
-3. **DNS for `mcp.jobrunr.io`.** Add a Cloudflare CNAME `mcp` → `jobrunr-docs-mcp.fly.dev` (proxied = orange cloud for
-   caching + DDoS), then in the Fly dashboard add `mcp.jobrunr.io` as a certificate. Update all docs/install instructions
-   to use the friendlier URL.
-4. **GitHub Actions auto-deploy.** Add a `FLY_API_TOKEN` repo secret (generate at fly.io/user/personal_access_tokens),
-   then every push to `main` will run tests and deploy via `.github/workflows/deploy.yml`.
+3. ~~**DNS for `mcp.jobrunr.io`.**~~ Done — that hostname serves the app and is the canonical URL everywhere in
+   this README. Note `jobrunr-docs-mcp.fly.dev` no longer resolves at all, so any install instructions still
+   pointing there (jobrunr.io website, older blog posts) are broken and need updating.
+4. **GitHub Actions auto-deploy.** Still outstanding — the `deploy` job has failed on every push since May with
+   `no access token available`, so deploys are manual. Add a `FLY_API_TOKEN` repo secret (generate at
+   fly.io/user/personal_access_tokens) and `.github/workflows/deploy.yml` will test, deploy and smoke-test
+   each push to `main`.
 5. **Shrink the Docker image and drop VM size.** Current image is ~240 MB because Spring AI's `TransformersEmbeddingModel`
    pulls in DJL + a 150 MB libtorch native lib at first run, which is why the VM is 2 GB instead of the planned 512 MB.
    Options:
