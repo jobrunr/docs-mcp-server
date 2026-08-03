@@ -1,21 +1,18 @@
 package io.jobrunr.docsmcp.tools;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.databind.ObjectMapper;
 import io.jobrunr.docsmcp.index.DocsRegistry;
 import io.jobrunr.docsmcp.index.HybridSearch;
 import io.jobrunr.docsmcp.index.LuceneIndex;
 import io.jobrunr.docsmcp.index.VectorIndex;
 import io.jobrunr.docsmcp.model.DocsCatalog;
 import io.jobrunr.docsmcp.model.SearchHit;
+import io.jobrunr.docsmcp.testsupport.DeterministicEmbeddingModel;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
-import org.springframework.ai.embedding.EmbeddingModel;
-import org.springframework.ai.embedding.EmbeddingRequest;
-import org.springframework.ai.embedding.EmbeddingResponse;
 
 import java.io.InputStream;
 import java.util.List;
-import java.util.zip.CRC32;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -109,36 +106,4 @@ class DocsToolsTest {
                 .contains("background-methods", "configuration");
     }
 
-    /**
-     * Deterministic 32-dim embedding so tests don't need to download an ONNX model.
-     * Quality is irrelevant — we only validate wiring.
-     */
-    static final class DeterministicEmbeddingModel implements EmbeddingModel {
-        @Override
-        public float[] embed(String text) {
-            float[] v = new float[32];
-            CRC32 crc = new CRC32();
-            for (int i = 0; i < v.length; i++) {
-                crc.reset();
-                crc.update((text + ":" + i).getBytes());
-                v[i] = (crc.getValue() % 1000) / 1000f - 0.5f;
-            }
-            return v;
-        }
-
-        @Override
-        public EmbeddingResponse call(EmbeddingRequest request) {
-            List<org.springframework.ai.embedding.Embedding> items = new java.util.ArrayList<>();
-            int i = 0;
-            for (String t : request.getInstructions()) {
-                items.add(new org.springframework.ai.embedding.Embedding(embed(t), i++));
-            }
-            return new EmbeddingResponse(items);
-        }
-
-        @Override
-        public float[] embed(org.springframework.ai.document.Document document) {
-            return embed(document.getText());
-        }
-    }
 }

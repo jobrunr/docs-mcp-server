@@ -1,6 +1,6 @@
 package io.jobrunr.docsmcp.index;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.databind.ObjectMapper;
 import io.jobrunr.docsmcp.model.DocsCatalog;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;

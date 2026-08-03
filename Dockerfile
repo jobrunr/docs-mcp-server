@@ -3,9 +3,11 @@ WORKDIR /workspace
 COPY pom.xml ./
 RUN mvn -B -q dependency:go-offline
 COPY src ./src
+# Spring Boot 4 removed the `layertools` jarmode; `tools extract --layers` replaces it
+# and produces the same dependencies/spring-boot-loader/snapshot-dependencies/application split.
 RUN mvn -B -q -DskipTests package \
  && mkdir -p target/extracted \
- && java -Djarmode=layertools -jar target/jobrunr-docs-mcp-*.jar extract --destination target/extracted
+ && java -Djarmode=tools -jar target/jobrunr-docs-mcp-*.jar extract --layers --launcher --destination target/extracted
 
 FROM eclipse-temurin:21-jre-jammy
 WORKDIR /app

@@ -8,7 +8,14 @@ spring:
     mcp:
       server:
         name: jobrunr-docs
-        version: 0.1.0
+        version: 0.2.0
+        # Streamable HTTP (single POST endpoint) is what current MCP clients speak.
+        # The deprecated HTTP+SSE pair (/sse + /mcp/message) is kept alive alongside it
+        # by LegacySseTransportConfig for clients installed before this change.
+        protocol: streamable
+        streamable-http:
+          mcp-endpoint: /mcp
+          keep-alive-interval: 25s
         instructions: |
           JobRunr documentation MCP server.
 

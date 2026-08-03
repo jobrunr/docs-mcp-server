@@ -4,9 +4,20 @@ Hosted [Model Context Protocol](https://modelcontextprotocol.io) server that exp
 
 Add one URL to your IDE config and JobRunr docs are live in every conversation — your agent stops hallucinating APIs and starts citing real `jobrunr.io` pages.
 
-**Live endpoint:** `https://jobrunr-docs-mcp.fly.dev` (until DNS for `mcp.jobrunr.io` is wired)
+**Live endpoint:** `https://jobrunr-docs-mcp.fly.dev/mcp` (until DNS for `mcp.jobrunr.io` is wired)
 
-Built on Spring Boot 3.3 + Spring AI's MCP server starter + Apache Lucene (BM25) + a local ONNX MiniLM embedding model. Retrieval is hybrid: BM25 and semantic search combined via Reciprocal Rank Fusion.
+Built on Spring Boot 4.1 + Spring AI 2.0's MCP server starter + Apache Lucene (BM25) + a local ONNX MiniLM embedding model. Retrieval is hybrid: BM25 and semantic search combined via Reciprocal Rank Fusion.
+
+### Transports
+
+The server speaks **Streamable HTTP** at `/mcp` — the transport every current MCP client uses, where each
+JSON-RPC message is its own HTTP POST. It negotiates protocol versions `2024-11-05` through `2025-11-25`;
+newer clients negotiate down to `2025-11-25`.
+
+The deprecated **HTTP+SSE** transport (`GET /sse` + `POST /mcp/message`, protocol `2024-11-05`) still runs
+alongside it so clients installed before Streamable HTTP landed keep working. It is deprecated upstream and
+will be removed once that traffic stops — new installs should use `/mcp`. Set `MCP_LEGACY_SSE_ENABLED=false`
+to switch it off.
 
 ## Tools
 
@@ -32,10 +43,13 @@ The `form: "mcp-trial"` field is hardcoded server-side so n8n can route MCP-sour
 ### Claude Code
 
 ```
-claude mcp add --transport sse jobrunr-docs https://jobrunr-docs-mcp.fly.dev/sse
+claude mcp add --transport http jobrunr-docs https://jobrunr-docs-mcp.fly.dev/mcp
 ```
 
 Restart Claude Code, then ask about anything JobRunr-related. Run `/mcp` inside Claude Code to confirm the connection.
+
+If you added this server before August 2026 you'll have it on the old SSE URL. That still works, but re-add it
+to move to the current transport: `claude mcp remove jobrunr-docs` then the command above.
 
 ### Cursor
 
@@ -45,7 +59,7 @@ Add to `~/.cursor/mcp.json`:
 {
   "mcpServers": {
     "jobrunr-docs": {
-      "url": "https://jobrunr-docs-mcp.fly.dev/sse"
+      "url": "https://jobrunr-docs-mcp.fly.dev/mcp"
     }
   }
 }
@@ -55,24 +69,35 @@ Restart Cursor. Tools appear under Settings → MCP.
 
 ### VS Code / Windsurf / others
 
-Use the same SSE URL — `https://jobrunr-docs-mcp.fly.dev/sse` — with whatever MCP config the client expects. Most accept a one-line `url` entry.
+Use the same URL — `https://jobrunr-docs-mcp.fly.dev/mcp` — with whatever MCP config the client expects. Most accept a one-line `url` entry.
 
 ### MCP Inspector (debugging)
 
 ```
-npx @modelcontextprotocol/inspector
+npx @modelcontextprotocol/inspector --cli https://jobrunr-docs-mcp.fly.dev/mcp --transport http --method tools/list
 ```
 
-In the browser UI: transport = **SSE**, URL = **`https://jobrunr-docs-mcp.fly.dev/sse`**, click Connect.
+Or drop the `--cli …` flags for the browser UI: transport = **Streamable HTTP**, URL = **`https://jobrunr-docs-mcp.fly.dev/mcp`**, click Connect.
 
 ### Raw curl
 
 ```bash
 curl https://jobrunr-docs-mcp.fly.dev/actuator/health
 # {"status":"UP",...}
+
+# Full JSON-RPC handshake — this is exactly what a client's first request looks like:
+curl -X POST https://jobrunr-docs-mcp.fly.dev/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'MCP-Protocol-Version: 2025-11-25' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":"2025-11-25","capabilities":{},
+        "clientInfo":{"name":"curl","version":"1.0"}}}'
 ```
 
-For a full JSON-RPC roundtrip, see the SSE handshake convention in `docs/protocol.md` (TODO) or the `mcp-inspector` HTTP traces.
+The response carries an `Mcp-Session-Id` header; send it back on every subsequent POST (`tools/list`,
+`tools/call`, …). Note the `Accept` header must list both types — the spec requires it and the server
+returns `400` without it.
 
 ## Local development
 
@@ -116,7 +141,8 @@ Tests use the bundled `src/test/resources/sample-docs.json` so they don't depend
        └── DocsTools            @Tool methods → MCP tools/call
             │
             ▼
-   Streamable HTTP / SSE  ──►  Claude Code / Cursor / ...
+   Streamable HTTP /mcp   ──►  Claude Code / Cursor / ...
+   (+ deprecated /sse)
 ```
 
 The server **never generates answers** — it surfaces relevant pages and lets the client LLM synthesize. Stateless apart from the in-memory indexes.
@@ -125,10 +151,16 @@ The server **never generates answers** — it surfaces relevant pages and lets t
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /sse` | MCP Streamable HTTP / SSE entry |
-| `POST /mcp/message?sessionId=…` | JSON-RPC messages (advertised over SSE) |
+| `POST /mcp` | **MCP Streamable HTTP endpoint** — every JSON-RPC message. What clients should use. |
+| `GET /mcp` | Standalone SSE stream for server-initiated messages (same session) |
+| `GET /sse` | _Deprecated_ HTTP+SSE entry, kept for clients installed before Streamable HTTP |
+| `POST /mcp/message?sessionId=…` | _Deprecated_ JSON-RPC messages for the above (advertised over SSE) |
 | `GET /actuator/health` | Liveness + readiness |
 | `POST /admin/reindex` | Force reload of `docs.json` (HMAC headers required) |
+
+Both transports are served by the same application on the same port and expose the same tools — the legacy
+one runs as a second in-process MCP server (`LegacySseTransportConfig`) sharing the primary server's tool
+specifications and capabilities. Idle streams are kept alive by protocol-level `ping` messages every 25 s.
 
 `/admin/reindex` requires two headers:
 
@@ -150,6 +182,12 @@ The JobRunr website's GitHub Actions deploy step builds these automatically (see
 | `MCP_REINDEX_SECRET` | _(empty)_ | HMAC secret for `/admin/reindex`. If empty, the endpoint returns 503. |
 | `TRIAL_WEBHOOK_URL` | n8n webhook | Where `request_jobrunr_pro_trial` POSTs trial submissions. |
 | `TRIAL_TIMEOUT` | `PT10S` | Webhook call timeout. |
+| `MCP_LEGACY_SSE_ENABLED` | `true` | Serve the deprecated `/sse` transport alongside `/mcp`. Set `false` to retire it. |
+| `RATELIMIT_ENABLED` | `false` | Per-IP rate limiting. See the caveat below before enabling. |
+
+> **Rate limiting caveat.** Under Streamable HTTP every tool call is its own POST, whereas the old SSE
+> transport counted one long-lived GET per session. The existing 10 requests/minute default is therefore far
+> more aggressive than it used to be — retune `RATELIMIT_RPM` before turning `RATELIMIT_ENABLED` on.
 
 ## Things still to do before this is "production"
 

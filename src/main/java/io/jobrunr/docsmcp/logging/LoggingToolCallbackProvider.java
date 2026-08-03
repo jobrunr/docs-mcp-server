@@ -1,9 +1,5 @@
 package io.jobrunr.docsmcp.logging;
 
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.model.ToolContext;
@@ -11,6 +7,10 @@ import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.ai.tool.definition.ToolDefinition;
 import org.springframework.ai.tool.metadata.ToolMetadata;
+import tools.jackson.core.type.TypeReference;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.node.ObjectNode;
 
 import java.time.Instant;
 import java.util.Arrays;
@@ -167,10 +167,10 @@ public class LoggingToolCallbackProvider implements ToolCallbackProvider {
     }
 
     private JsonNode trim(JsonNode node) {
-        if (node.isTextual()) {
-            String s = node.textValue();
+        if (node.isString()) {
+            String s = node.stringValue();
             if (s.length() > MAX_FIELD_CHARS) {
-                return objectMapper.getNodeFactory().textNode("<truncated:" + s.length() + ">");
+                return objectMapper.getNodeFactory().stringNode("<truncated:" + s.length() + ">");
             }
             return node;
         }
@@ -181,7 +181,7 @@ public class LoggingToolCallbackProvider implements ToolCallbackProvider {
         }
         if (node.isObject()) {
             ObjectNode obj = objectMapper.createObjectNode();
-            node.fields().forEachRemaining(e -> obj.set(e.getKey(), trim(e.getValue())));
+            node.properties().forEach(e -> obj.set(e.getKey(), trim(e.getValue())));
             return obj;
         }
         return node;

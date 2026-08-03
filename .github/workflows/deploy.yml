@@ -35,14 +35,50 @@ jobs:
 
       - name: Smoke test
         env:
-          HEALTH_URL: ${{ vars.HEALTH_URL || 'https://jobrunr-docs-mcp.fly.dev/actuator/health' }}
+          BASE_URL: ${{ vars.BASE_URL || 'https://jobrunr-docs-mcp.fly.dev' }}
         run: |
           for i in 1 2 3 4 5 6; do
-            if curl -fsS "$HEALTH_URL" | grep -q '"status":"UP"'; then
+            if curl -fsS "$BASE_URL/actuator/health" | grep -q '"status":"UP"'; then
               echo "healthy"
-              exit 0
+              healthy=1
+              break
             fi
             sleep 10
           done
-          echo "health check failed against $HEALTH_URL"
-          exit 1
+          if [ -z "$healthy" ]; then
+            echo "health check failed against $BASE_URL/actuator/health"
+            exit 1
+          fi
+
+          # The transport itself: a POST that a real MCP client would make. This is the
+          # regression that motivated the Streamable HTTP work — it used to return 405.
+          response=$(curl -fsS -X POST "$BASE_URL/mcp" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -H 'MCP-Protocol-Version: 2025-11-25' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                  "protocolVersion":"2025-11-25","capabilities":{},
+                  "clientInfo":{"name":"ci-smoke","version":"1.0"}}}') || {
+            echo "POST $BASE_URL/mcp failed"
+            exit 1
+          }
+          echo "$response"
+          echo "$response" | grep -q '"protocolVersion"' || {
+            echo "initialize did not negotiate a protocol version"
+            exit 1
+          }
+          echo "$response" | grep -q '"name":"jobrunr-docs"' || {
+            echo "unexpected serverInfo"
+            exit 1
+          }
+
+          # The deprecated transport must keep answering for clients installed on the old URL.
+          # curl always exits non-zero here — the SSE stream stays open until --max-time
+          # kills it — so judge on the bytes received, not the exit status.
+          sse_head=$(curl -sS --max-time 10 -H 'Accept: text/event-stream' "$BASE_URL/sse" || true)
+          echo "$sse_head" | grep -q '/mcp/message' || {
+            echo "legacy /sse endpoint no longer advertises its message endpoint"
+            echo "received: $sse_head"
+            exit 1
+          }
+          echo "smoke test passed: /mcp and /sse both healthy"

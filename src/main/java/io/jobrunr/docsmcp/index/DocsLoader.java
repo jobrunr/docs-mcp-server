@@ -1,6 +1,5 @@
 package io.jobrunr.docsmcp.index;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import io.jobrunr.docsmcp.model.DocsCatalog;
 import io.jobrunr.docsmcp.model.Manifest;
 import org.slf4j.Logger;
@@ -12,6 +11,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
+import tools.jackson.databind.ObjectMapper;
 
 import java.net.URI;
 import java.nio.file.Files;
