@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JobRunr MCP · Connect your cluster</title>
+  <meta name="description" content="Let Claude Code, Cursor or any MCP client see and operate your JobRunr cluster. Free for JobRunr OSS.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Poppins:wght@600;700;800&family=Ubuntu+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%2306121e' stroke='%238b5cf6' stroke-width='3'/%3E%3Ccircle cx='16' cy='16' r='6' fill='%232ee6a6'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/hub.css">
+</head>
+<body>
+<div class="glow"></div>
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="/signup"><img src="/jobrunr-logo.png" alt="JobRunr"><span class="pill">MCP</span></a>
+    <span class="pill ghost">Free for JobRunr OSS</span>
+  </header>
+
+  <div class="grid-2">
+    <section>
+      <h1>Let your AI agent <em>operate</em> your JobRunr cluster</h1>
+      <p class="lead">Connect your application once, then ask Claude Code, Cursor or VS Code what is going on with your background jobs, and have it fix what it can.</p>
+      <ul class="checks">
+        <li>See failing jobs with their exception and full history, straight from your editor</li>
+        <li>Group failures by cause during an incident, instead of paging through the dashboard</li>
+        <li>Requeue a whole group after the fix, with a preview you approve first</li>
+        <li>The JobRunr docs are in the same server, so your agent reads the right page next to the stack trace</li>
+      </ul>
+
+      <h2>How it works</h2>
+      <ol class="steps">
+        <li><strong>Sign up</strong> and confirm your email. You get a connector token and an agent token.</li>
+        <li><strong>Add the connector token</strong> to your application config. Your app opens an outbound connection to us, so there is no port to open.</li>
+        <li><strong>Add the agent token</strong> to your MCP client. One URL, one header.</li>
+      </ol>
+
+      <h3>What leaves your JVM</h3>
+      <p class="muted">Only what your agent asks for, while it asks: job names, states, exceptions and parameter types. Job parameter values are replaced by <code>&lt;redacted&gt;</code> inside your application before anything is sent. The connector also shares your JobRunr, Java and framework version and your job counts per state, so we can show them on your account page. We never store job data or tool results. Tokens are read-only unless you allow operate actions.</p>
+    </section>
+
+    <section class="card" aria-labelledby="form-title">
+      <div id="signup-view">
+        <h2 id="form-title">Get your tokens</h2>
+        <p class="muted">Free for one cluster. Already signed up? <button class="linkish" type="button" id="show-signin">Send me a sign-in link</button></p>
+        <form id="signup-form" novalidate>
+          <label for="name">Name</label>
+          <input id="name" name="name" type="text" autocomplete="name" required>
+          <label for="email">Work email</label>
+          <input id="email" name="email" type="email" autocomplete="email" required>
+          <label for="company">Company</label>
+          <input id="company" name="company" type="text" autocomplete="organization" required>
+          <label for="role">Role <span class="opt">(optional)</span></label>
+          <input id="role" name="role" type="text" placeholder="Backend developer, SRE, CTO…">
+          <label for="useCase">What should your agent help with? <span class="opt">(optional)</span></label>
+          <textarea id="useCase" name="useCase" placeholder="For example: find out why invoice jobs fail at night and requeue them"></textarea>
+          <button class="btn" type="submit" id="signup-submit">Email me a confirmation link</button>
+          <p class="muted" style="margin-top:18px">We use your details to run your account and may follow up about JobRunr. The docs MCP keeps working without an account.</p>
+          <div class="alert error" id="signup-error" role="alert"></div>
+        </form>
+      </div>
+
+      <div id="signin-view" class="hidden">
+        <h2>Sign in</h2>
+        <p class="muted">We email you a link that signs you in. New here? <button class="linkish" type="button" id="show-signup">Create an account</button></p>
+        <form id="signin-form" novalidate>
+          <label for="signin-email">Email</label>
+          <input id="signin-email" name="email" type="email" autocomplete="email" required>
+          <button class="btn" type="submit" id="signin-submit">Send me a sign-in link</button>
+          <div class="alert error" id="signin-error" role="alert"></div>
+        </form>
+      </div>
+
+      <div id="sent-view" class="hidden">
+        <h2>Check your inbox</h2>
+        <p>We sent a link to <strong id="sent-to"></strong>. It works once and expires in 30 minutes.</p>
+        <p class="muted">Nothing there after a minute? Check your spam folder, or <button class="linkish" type="button" id="try-again">try again</button>.</p>
+      </div>
+    </section>
+  </div>
+
+  <footer>JobRunr MCP is run by JobRunr BV. Job processing never depends on it: if this server is down, your jobs keep running.</footer>
+</div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const FREE_MAIL = ["gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com", "yahoo.com", "icloud.com", "me.com", "proton.me", "protonmail.com", "gmx.com", "gmx.de", "aol.com", "mail.com", "yandex.com", "telenet.be", "skynet.be"];
+  let companyTouched = false;
+
+  function show(view) {
+    ["signup-view", "signin-view", "sent-view"].forEach((v) => $(v).classList.toggle("hidden", v !== view));
+  }
+  function showError(id, message) {
+    const el = $(id);
+    el.textContent = message;
+    el.classList.add("show");
+  }
+  function clearError(id) {
+    $(id).classList.remove("show");
+  }
+
+  $("company").addEventListener("input", () => { companyTouched = true; });
+  $("email").addEventListener("input", () => {
+    if (companyTouched) return;
+    const domain = ($("email").value.split("@")[1] || "").toLowerCase();
+    if (!domain.includes(".") || FREE_MAIL.includes(domain)) { $("company").value = ""; return; }
+    const name = domain.split(".").slice(-2, -1)[0] || "";
+    $("company").value = name.split(/[-_]/).filter(Boolean).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+  });
+
+  async function post(url, body) {
+    const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const json = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(json.error || "Something went wrong. Please try again.");
+    return json;
+  }
+
+  $("signup-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    clearError("signup-error");
+    const form = event.target;
+    const data = Object.fromEntries(new FormData(form).entries());
+    if (!data.name || !data.email || !data.company) { showError("signup-error", "Please fill in your name, work email and company."); return; }
+    $("signup-submit").disabled = true;
+    try {
+      await post("/api/signup", data);
+      $("sent-to").textContent = data.email;
+      show("sent-view");
+    } catch (e) {
+      showError("signup-error", e.message);
+    } finally {
+      $("signup-submit").disabled = false;
+    }
+  });
+
+  $("signin-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    clearError("signin-error");
+    const email = $("signin-email").value.trim();
+    if (!email) { showError("signin-error", "Please enter your email."); return; }
+    $("signin-submit").disabled = true;
+    try {
+      await post("/api/signin", { email });
+      $("sent-to").textContent = email;
+      show("sent-view");
+    } catch (e) {
+      showError("signin-error", e.message);
+    } finally {
+      $("signin-submit").disabled = false;
+    }
+  });
+
+  $("show-signin").addEventListener("click", () => show("signin-view"));
+  $("show-signup").addEventListener("click", () => show("signup-view"));
+  $("try-again").addEventListener("click", () => show("signup-view"));
+  if (location.hash === "#signin") show("signin-view");
+})();
+</script>
+</body>
+</html>

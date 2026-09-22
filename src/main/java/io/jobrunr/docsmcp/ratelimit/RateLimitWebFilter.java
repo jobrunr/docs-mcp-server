@@ -51,7 +51,7 @@ public class RateLimitWebFilter implements WebFilter {
         if (!enabled) return chain.filter(exchange);
 
         String path = exchange.getRequest().getPath().value();
-        if (path.startsWith("/actuator")) {
+        if (path.startsWith("/actuator") || path.startsWith("/connector/")) {
             return chain.filter(exchange);
         }
 
