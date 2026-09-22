@@ -110,20 +110,26 @@ http://localhost:18080/signup, open the email at http://localhost:8025, create t
 `~/jobrunr-mcp-demo` with the connector token (see its README). Without SMTP settings the sign-in link is written to
 the log instead.
 
-### Deploying the ops hub
+### Deploying the ops hub (Coolify)
 
-Not deployed yet. Before it goes to `mcp.jobrunr.io`:
+The app is deployed by Coolify from `main` (build pack Dockerfile, port 8080, health check `/actuator/health`), the
+same way as the finance demo and the audit app. A push to `main` deploys. Before signups can work:
 
-1. **Run one machine.** Connector state is in memory: `fly scale count 1`.
-2. **Persist the database.** `fly volumes create hub_data --region ams --size 1`, mount it at `/data`
-   (`[mounts] source = "hub_data"`, `destination = "/data"`), `chown 1001:1001 /data` once (the image runs as uid 1001)
-   and set `HUB_DB_URL=jdbc:h2:file:/data/hub/hub`. PostgreSQL works too, the schema is portable.
-3. **Mail.** `SPRING_MAIL_HOST`, `SPRING_MAIL_PORT`, `SPRING_MAIL_USERNAME`, `SPRING_MAIL_PASSWORD`,
-   `SPRING_MAIL_PROPERTIES_MAIL_SMTP_STARTTLS_ENABLE=true`, and `HUB_MAIL_FROM` on a domain with SPF and DKIM.
-4. **Leads.** `HUB_LEADS_WEBHOOK_URL` pointing at an n8n workflow that upserts the HubSpot contact. Payload:
-   `form` (`mcp-ops-verified`, `mcp-ops-first-connection`, `mcp-ops-pro-feature-attempt`,
-   `mcp-ops-second-cluster-attempt`), `email`, `name`, `company`, `role`, `use_case`, `detail`, `source=mcp-ops`.
+1. **Mail.** Copy the SMTP variables from the finance demo (`finance.demo.jobrunr.io`) to this app in Coolify:
+   `SPRING_MAIL_HOST`, `SPRING_MAIL_PORT`, `SPRING_MAIL_USERNAME`, `SPRING_MAIL_PASSWORD` and
+   `SPRING_MAIL_PROPERTIES_MAIL_SMTP_STARTTLS_ENABLE=true`. The hub sends as `noreply@jobrunr.io`, like the tour
+   (`HUB_MAIL_FROM` overrides it). Without these, `/api/signup` answers 503 "signups are paused" and the link is only
+   written to the container log.
+2. **Persistent storage.** Add a volume mount at `/app/data` (Coolify: Storages, volume mount). The image creates
+   that directory owned by the app user, so a new named volume takes over the ownership. Without it every deploy
+   wipes accounts and tokens, and every customer's connector token stops working.
+3. **One replica.** Connector state is in memory.
+4. **Leads.** `HUB_LEADS_WEBHOOK_URL` for the n8n workflow that upserts the HubSpot contact. Payload: `form`
+   (`mcp-ops-verified`, `mcp-ops-first-connection`, `mcp-ops-pro-feature-attempt`, `mcp-ops-second-cluster-attempt`),
+   `email`, `name`, `company`, `role`, `use_case`, `detail`, `source=mcp-ops`.
 5. **Privacy page and DPA** before public signups (plan section 5).
+
+`fly.toml` and `.github/workflows/deploy.yml` are left over from the Fly.io days and are not used.
 
 ## Use it
 

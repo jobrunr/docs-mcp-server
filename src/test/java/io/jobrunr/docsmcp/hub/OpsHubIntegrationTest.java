@@ -344,6 +344,11 @@ class OpsHubIntegrationTest {
         }
 
         @Override
+        public boolean isConfigured() {
+            return true;
+        }
+
+        @Override
         public void sendSignInLink(Account account, String link, boolean firstTime) {
             links.put(account.email(), link);
         }

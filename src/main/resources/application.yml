@@ -68,7 +68,7 @@ log:
 
 hub:
   public-url: ${HUB_PUBLIC_URL:https://mcp.jobrunr.io}
-  mail-from: ${HUB_MAIL_FROM:JobRunr MCP <mcp@jobrunr.io>}
+  mail-from: ${HUB_MAIL_FROM:JobRunr <noreply@jobrunr.io>}
   leads-webhook-url: ${HUB_LEADS_WEBHOOK_URL:}
   poll-hold: ${HUB_POLL_HOLD:PT25S}
   request-timeout: ${HUB_REQUEST_TIMEOUT:PT20S}

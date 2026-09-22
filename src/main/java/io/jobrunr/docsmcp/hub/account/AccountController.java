@@ -5,6 +5,8 @@ import io.jobrunr.docsmcp.hub.connector.ConnectorHub;
 import io.jobrunr.docsmcp.hub.connector.InstanceMonitor;
 import io.jobrunr.docsmcp.hub.leads.LeadEvents;
 import io.jobrunr.docsmcp.web.ClientIpExtractor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseCookie;
 import org.springframework.http.ResponseEntity;
@@ -33,6 +35,8 @@ import java.util.regex.Pattern;
 public class AccountController {
 
     static final String SESSION_COOKIE = "jr_mcp_session";
+
+    private static final Logger log = LoggerFactory.getLogger(AccountController.class);
 
     private static final Pattern EMAIL = Pattern.compile("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$");
     private static final Duration EMAIL_COOLDOWN = Duration.ofSeconds(60);
@@ -78,11 +82,11 @@ public class AccountController {
         if (company == null) return badRequest("Please enter your company.");
 
         return blocking(() -> {
+            if (!mailer.isConfigured()) return mailNotConfigured();
             if (!allowLink(email, exchange)) return tooManyRequests();
             Optional<Account> existing = store.findByEmail(email);
             Account account = existing.orElseGet(() -> store.create(email, name, company, trim(request.role(), 200), trim(request.useCase(), 1000)));
-            sendLink(account, account.verifiedAt() == null);
-            return ResponseEntity.ok(Map.<String, Object>of("status", "check-your-inbox"));
+            return sendLink(account, account.verifiedAt() == null);
         });
     }
 
@@ -91,10 +95,12 @@ public class AccountController {
         String email = trim(request.email(), 320);
         if (email == null || !EMAIL.matcher(email).matches()) return badRequest("Please enter a valid email address.");
         return blocking(() -> {
+            if (!mailer.isConfigured()) return mailNotConfigured();
             if (!allowLink(email, exchange)) return tooManyRequests();
             // same answer whether or not the account exists, so the form cannot be used to probe for accounts
-            store.findByEmail(email).ifPresent(account -> sendLink(account, account.verifiedAt() == null));
-            return ResponseEntity.ok(Map.<String, Object>of("status", "check-your-inbox"));
+            return store.findByEmail(email)
+                    .map(account -> sendLink(account, account.verifiedAt() == null))
+                    .orElseGet(() -> ResponseEntity.ok(Map.of("status", "check-your-inbox")));
         });
     }
 
@@ -178,9 +184,19 @@ public class AccountController {
                 .orElseGet(() -> ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Not signed in"))));
     }
 
-    private void sendLink(Account account, boolean firstTime) {
+    private ResponseEntity<Map<String, Object>> sendLink(Account account, boolean firstTime) {
         String secret = store.createMagicLink(account.id(), properties.magicLinkTtl());
-        mailer.sendSignInLink(account, properties.publicUrl() + "/verify#" + secret, firstTime);
+        try {
+            mailer.sendSignInLink(account, properties.publicUrl() + "/verify#" + secret, firstTime);
+        } catch (RuntimeException e) {
+            log.warn("Could not send the sign-in link to {}: {}", account.emailDomain(), e.toString());
+            return ResponseEntity.status(HttpStatus.BAD_GATEWAY).body(Map.of("error", "We could not send the email. Please try again in a few minutes."));
+        }
+        return ResponseEntity.ok(Map.of("status", "check-your-inbox"));
+    }
+
+    private static ResponseEntity<Map<String, Object>> mailNotConfigured() {
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(Map.of("error", "This server cannot send email yet, so signups are paused. Please try again later."));
     }
 
     private boolean allowLink(String email, ServerWebExchange exchange) {

@@ -11,7 +11,7 @@ RUN mvn -B -q -DskipTests package \
 
 FROM eclipse-temurin:21-jre-jammy
 WORKDIR /app
-RUN useradd -r -u 1001 app && chown app:app /app
+RUN useradd -r -u 1001 app && mkdir -p /app/data && chown -R app:app /app
 USER app
 COPY --from=build /workspace/target/extracted/dependencies/ ./
 COPY --from=build /workspace/target/extracted/spring-boot-loader/ ./
