@@ -24,9 +24,10 @@ primary_region = "ams"
     handlers = ["tls", "http"]
 
   [services.concurrency]
+    # every connected JobRunr instance holds one long-poll open; the app is non-blocking so these are cheap
     type = "requests"
-    soft_limit = 50
-    hard_limit = 100
+    soft_limit = 250
+    hard_limit = 500
 
   [[services.http_checks]]
     interval = "30s"
