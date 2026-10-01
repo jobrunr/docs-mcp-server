@@ -54,14 +54,24 @@
 
   <section class="card">
     <h2>1. Connect your application</h2>
-    <p class="muted">Private beta: needs a JobRunr build that includes the MCP connector. The connector runs inside the JobRunr dashboard, so enable the dashboard on at least one instance.</p>
+    <p class="muted">Install the plugin with your favorite build tool. It needs Java 17 and JobRunr 8.5.0 or later.</p>
+    <div class="tabs" role="tablist" data-group="build">
+      <button class="tab" role="tab" aria-selected="true" data-tab="maven">Maven</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="gradle">Gradle</button>
+    </div>
+    <div class="codebox" data-panel="build:maven"><pre id="install-maven">&lt;dependency&gt;
+    &lt;groupId&gt;org.jobrunr&lt;/groupId&gt;
+    &lt;artifactId&gt;jobrunr-mcp&lt;/artifactId&gt;
+    &lt;version&gt;1.0.0-beta.0&lt;/version&gt;
+&lt;/dependency&gt;</pre><button class="btn secondary small copy" type="button" data-copy="install-maven">Copy</button></div>
+    <div class="codebox hidden" data-panel="build:gradle"><pre id="install-gradle">implementation("org.jobrunr:jobrunr-mcp:1.0.0-beta.0")</pre><button class="btn secondary small copy" type="button" data-copy="install-gradle">Copy</button></div>
+    <p class="muted" style="margin-top:18px">Then give it your connector token. The JobRunr dashboard does not have to run.</p>
     <div class="tabs" role="tablist" data-group="app">
       <button class="tab" role="tab" aria-selected="true" data-tab="spring">Spring Boot</button>
-      <button class="tab" role="tab" aria-selected="false" data-tab="fluent">Fluent API</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="java">Plain Java</button>
     </div>
     <div class="codebox" data-panel="app:spring"><pre id="snippet-spring"></pre><button class="btn secondary small copy" type="button" data-copy="snippet-spring">Copy</button></div>
-    <div class="codebox hidden" data-panel="app:fluent"><pre id="snippet-fluent"></pre><button class="btn secondary small copy" type="button" data-copy="snippet-fluent">Copy</button></div>
-    <p class="muted">Job parameter values are redacted before they leave your JVM. Set <code>jobrunr.dashboard.mcp.redact-job-parameters=false</code> only if they hold no personal data.</p>
+    <div class="codebox hidden" data-panel="app:java"><pre id="snippet-java"></pre><button class="btn secondary small copy" type="button" data-copy="snippet-java">Copy</button></div>
   </section>
 
   <section class="card">
@@ -126,15 +136,10 @@
     const url = state.publicUrl + "/mcp";
     $("snippet-spring").textContent =
 `# application.properties
-jobrunr.dashboard.enabled=true
 jobrunr.dashboard.mcp.token=${connector}` + (state.publicUrl !== "https://mcp.jobrunr.io" ? `\njobrunr.dashboard.mcp.url=${state.publicUrl}` : "");
-    $("snippet-fluent").textContent =
-`JobRunr.configure()
-    .useStorageProvider(storageProvider)
-    .useBackgroundJobServer()
-    .useDashboard(usingStandardDashboardConfiguration()
-        .andMcpConnector("${connector}"${state.publicUrl !== "https://mcp.jobrunr.io" ? `, "${state.publicUrl}"` : ""}))
-    .initialize();`;
+    $("snippet-java").textContent =
+`// next to JobRunr.configure()...initialize(), with the same storageProvider
+new JobRunrMcpConnector("${connector}"` + (state.publicUrl !== "https://mcp.jobrunr.io" ? `, "${state.publicUrl}", storageProvider, JsonMapperFactory.createJsonMapper()` : ", storageProvider") + `).start();`;
     $("snippet-claude").textContent = `claude mcp add --transport http jobrunr ${url} \\\n  --header "Authorization: Bearer ${agent}"`;
     $("snippet-cursor").textContent = JSON.stringify({ mcpServers: { jobrunr: { url, headers: { Authorization: "Bearer " + agent } } } }, null, 2);
     $("snippet-vscode").textContent = JSON.stringify({ servers: { jobrunr: { type: "http", url, headers: { Authorization: "Bearer " + agent } } } }, null, 2);

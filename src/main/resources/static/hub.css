@@ -42,6 +42,7 @@ h3 { font-size: 16px; font-weight: 600; }
 p.lead { font-size: 19px; color: var(--text-soft); max-width: 34em; }
 .muted { color: var(--text-muted); font-size: 14px; }
 .grid-2 { display: grid; grid-template-columns: 1.1fr .9fr; gap: 48px; align-items: start; }
+.grid-2 > * { min-width: 0; }
 .card { background: var(--card); border: 1px solid var(--card-border); border-radius: var(--radius); padding: 28px; box-shadow: 0 0 0 1px rgba(139,92,246,.08), 0 0 42px rgba(139,92,246,.18); }
 .card + .card { margin-top: 24px; }
 ul.checks { list-style: none; padding: 0; margin: 22px 0 28px; }
@@ -79,6 +80,7 @@ code, pre { font-family: var(--mono); font-size: 13.5px; }
 pre { margin: 10px 0 0; padding: 14px 16px; border-radius: 10px; background: #060b14; border: 1px solid var(--field-border); overflow-x: auto; white-space: pre; color: #dde4ee; }
 .codebox { position: relative; }
 .codebox .copy { position: absolute; top: 8px; right: 8px; }
+.codebox pre { padding-right: 90px; }
 .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }
 .tab { padding: 6px 12px; border-radius: 8px; border: 1px solid var(--field-border); background: transparent; color: var(--text-soft); cursor: pointer; font: 600 13px "Ubuntu Sans", system-ui, sans-serif; }
 .tab[aria-selected=true] { border-color: var(--green); color: var(--text); background: rgba(46,230,166,.08); }
@@ -104,6 +106,8 @@ footer { margin-top: 56px; color: var(--text-muted); font-size: 13px; }
 }
 @media (max-width: 640px) {
   .who { display: none; }
+  .codebox pre { padding-right: 16px; }
+  .codebox .copy { position: static; margin-top: 8px; }
 }
 @media (max-width: 480px) {
   .wrap { padding: 20px 16px 48px; }

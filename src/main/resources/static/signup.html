@@ -33,6 +33,18 @@
       <h2>How it works</h2>
       <ol class="steps">
         <li><strong>Sign up</strong> and confirm your email. You get a connector token and an agent token.</li>
+        <li><strong>Install the plugin</strong> with your favorite build tool. It needs Java 17 and JobRunr 8.5.0 or later.
+          <div class="tabs" role="tablist" data-group="build">
+            <button class="tab" role="tab" aria-selected="true" data-tab="maven">Maven</button>
+            <button class="tab" role="tab" aria-selected="false" data-tab="gradle">Gradle</button>
+          </div>
+          <div class="codebox" data-panel="build:maven"><pre id="install-maven">&lt;dependency&gt;
+    &lt;groupId&gt;org.jobrunr&lt;/groupId&gt;
+    &lt;artifactId&gt;jobrunr-mcp&lt;/artifactId&gt;
+    &lt;version&gt;1.0.0-beta.0&lt;/version&gt;
+&lt;/dependency&gt;</pre><button class="btn secondary small copy" type="button" data-copy="install-maven">Copy</button></div>
+          <div class="codebox hidden" data-panel="build:gradle"><pre id="install-gradle">implementation("org.jobrunr:jobrunr-mcp:1.0.0-beta.0")</pre><button class="btn secondary small copy" type="button" data-copy="install-gradle">Copy</button></div>
+        </li>
         <li><strong>Add the connector token</strong> to your application config. Your app opens an outbound connection to us, so there is no port to open.</li>
         <li><strong>Add the agent token</strong> to your MCP client. One URL, one header.</li>
       </ol>
@@ -151,6 +163,25 @@
     } finally {
       $("signin-submit").disabled = false;
     }
+  });
+
+  document.querySelectorAll(".tabs").forEach((tabs) => {
+    tabs.addEventListener("click", (event) => {
+      const tab = event.target.closest(".tab");
+      if (!tab) return;
+      const group = tabs.dataset.group;
+      tabs.querySelectorAll(".tab").forEach((t) => t.setAttribute("aria-selected", String(t === tab)));
+      document.querySelectorAll(`[data-panel^="${group}:"]`).forEach((panel) => panel.classList.toggle("hidden", panel.dataset.panel !== `${group}:${tab.dataset.tab}`));
+    });
+  });
+  document.addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-copy]");
+    if (!button) return;
+    try {
+      await navigator.clipboard.writeText($(button.dataset.copy).textContent);
+      button.textContent = "Copied";
+      setTimeout(() => { button.textContent = "Copy"; }, 1500);
+    } catch (e) { /* clipboard unavailable, the text is selectable */ }
   });
 
   $("show-signin").addEventListener("click", () => show("signin-view"));
