@@ -3,6 +3,8 @@ package io.jobrunr.docsmcp.hub;
 import io.jobrunr.docsmcp.hub.account.Account;
 import io.jobrunr.docsmcp.hub.account.AccountStore;
 import io.jobrunr.docsmcp.hub.account.Mailer;
+import io.jobrunr.docsmcp.logging.QueryLogClient;
+import io.jobrunr.docsmcp.logging.QueryLogEntry;
 import io.jobrunr.docsmcp.testsupport.DeterministicEmbeddingModel;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -30,6 +32,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 
@@ -63,6 +66,12 @@ class OpsHubIntegrationTest {
 
     @Autowired
     private CapturingMailer mailer;
+
+    @Autowired
+    private CapturingQueryLogClient queryLog;
+
+    @Autowired
+    private AccountStore store;
 
     private WebTestClient client;
     private FakeConnector connector;
@@ -152,6 +161,26 @@ class OpsHubIntegrationTest {
         // usage shows up on the account page, without arguments or results
         JsonNode activity = accountPage(sessionCookie).path("recentToolCalls");
         assertThat(activity.valueStream().map(c -> c.path("toolName").stringValue()).toList()).contains("get_cluster_overview", "requeue_jobs");
+
+        // the attribution tool gets the cluster tools and the lead events, with the account's domain and cluster
+        List<QueryLogEntry> logged = queryLog.entriesFor(store.findByEmail(email).orElseThrow().id());
+        assertThat(logged).extracting(QueryLogEntry::toolName).contains("hub_verified", "hub_first_connection",
+                "get_cluster_overview", "triage_failed_jobs", "get_job", "requeue_jobs", "search_jobs", "hub_pro_feature_attempt");
+        QueryLogEntry overviewRow = logged.stream().filter(e -> e.toolName().equals("get_cluster_overview")).findFirst().orElseThrow();
+        assertThat(overviewRow.source()).isEqualTo(QueryLogEntry.SOURCE_OPS);
+        assertThat(overviewRow.accountEmailDomain()).isEqualTo("acme.io");
+        assertThat(overviewRow.accountCompany()).isEqualTo("Acme");
+        assertThat(overviewRow.clusterId()).isEqualTo("cluster-1");
+        assertThat(overviewRow.resultMetadata()).containsEntry("jobrunrVersion", "9.0.0").containsKey("jobCounts")
+                .doesNotContainKey("backgroundJobServers");
+        assertThat(overviewRow.resultBodyTruncated()).isNull();
+        assertThat(logged.stream().filter(e -> e.toolName().equals("hub_first_connection")).findFirst().orElseThrow().clusterId())
+                .isEqualTo("cluster-1");
+        // job ids and search text name the user's jobs and stay in the hub
+        assertThat(logged.stream().filter(e -> QueryLogEntry.SOURCE_OPS.equals(e.source())).toList())
+                .allSatisfy(e -> assertThat(String.valueOf(e.arguments())).doesNotContain(FAILED_JOB_1, "invoice"));
+        assertThat(logged.stream().filter(e -> e.toolName().equals("requeue_jobs")).toList())
+                .allSatisfy(e -> assertThat(e.arguments()).containsEntry("job_ids_count", 2));
     }
 
     @Test
@@ -358,8 +387,31 @@ class OpsHubIntegrationTest {
         }
     }
 
+    static class CapturingQueryLogClient extends QueryLogClient {
+        private final List<QueryLogEntry> entries = new CopyOnWriteArrayList<>();
+
+        CapturingQueryLogClient() {
+            super("", "", Duration.ofSeconds(1));
+        }
+
+        @Override
+        public void fireAndForget(QueryLogEntry entry) {
+            entries.add(entry);
+        }
+
+        List<QueryLogEntry> entriesFor(String accountId) {
+            return entries.stream().filter(e -> accountId.equals(e.accountId())).toList();
+        }
+    }
+
     @TestConfiguration
     static class TestConfig {
+        @Bean
+        @Primary
+        CapturingQueryLogClient capturingQueryLogClient() {
+            return new CapturingQueryLogClient();
+        }
+
         @Bean
         EmbeddingModel embeddingModel() {
             return new DeterministicEmbeddingModel();

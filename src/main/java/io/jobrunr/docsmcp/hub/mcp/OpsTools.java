@@ -5,6 +5,9 @@ import io.jobrunr.docsmcp.hub.account.AccountStore;
 import io.jobrunr.docsmcp.hub.connector.ConnectorHub;
 import io.jobrunr.docsmcp.hub.connector.DashboardClient;
 import io.jobrunr.docsmcp.hub.leads.LeadEvents;
+import io.jobrunr.docsmcp.logging.QueryLogClient;
+import io.jobrunr.docsmcp.logging.QueryLogEntry;
+import io.jobrunr.docsmcp.logging.RequestContextHolder;
 import io.modelcontextprotocol.json.McpJsonMapper;
 import io.modelcontextprotocol.json.jackson3.JacksonMcpJsonMapper;
 import io.modelcontextprotocol.server.McpServerFeatures.SyncToolSpecification;
@@ -15,6 +18,7 @@ import io.modelcontextprotocol.spec.McpSchema.ToolAnnotations;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
@@ -67,17 +71,22 @@ public class OpsTools {
     private final ConnectorHub hub;
     private final AccountStore store;
     private final LeadEvents leadEvents;
+    private final QueryLogClient queryLogClient;
+    private final String serverVersion;
     private final ObjectMapper objectMapper;
     private final McpJsonMapper mcpJsonMapper;
     private final Map<String, RequeuePreview> previews = new ConcurrentHashMap<>();
     private final Map<String, Instant> lastProLead = new ConcurrentHashMap<>();
 
-    public OpsTools(DashboardClient dashboard, ConnectorHub hub, AccountStore store, LeadEvents leadEvents, ObjectMapper objectMapper,
-                    @Qualifier("mcpServerJsonMapper") JsonMapper mcpServerJsonMapper) {
+    public OpsTools(DashboardClient dashboard, ConnectorHub hub, AccountStore store, LeadEvents leadEvents, QueryLogClient queryLogClient,
+                    ObjectMapper objectMapper, @Qualifier("mcpServerJsonMapper") JsonMapper mcpServerJsonMapper,
+                    @Value("${spring.ai.mcp.server.version:unknown}") String serverVersion) {
         this.dashboard = dashboard;
         this.hub = hub;
         this.store = store;
         this.leadEvents = leadEvents;
+        this.queryLogClient = queryLogClient;
+        this.serverVersion = serverVersion;
         this.objectMapper = objectMapper;
         this.mcpJsonMapper = new JacksonMcpJsonMapper(mcpServerJsonMapper);
     }
@@ -467,7 +476,8 @@ public class OpsTools {
         Instant last = lastProLead.get(account.id());
         if (last == null || last.isBefore(Instant.now().minus(PRO_LEAD_COOLDOWN))) {
             lastProLead.put(account.id(), Instant.now());
-            leadEvents.record(account, LeadEvents.PRO_FEATURE_ATTEMPT, toolName);
+            RequestContextHolder.RequestContext rc = RequestContextHolder.peek();
+            leadEvents.record(account, LeadEvents.PRO_FEATURE_ATTEMPT, toolName, rc != null ? rc.clientIp() : null);
         }
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("proFeature", true);
@@ -498,34 +508,91 @@ public class OpsTools {
         if (!(account instanceof Account a)) return error("Not authenticated. Add your JobRunr MCP agent token as a Bearer token.");
 
         long start = System.nanoTime();
-        boolean success = false;
+        Map<String, Object> arguments = request.arguments() == null ? Map.of() : request.arguments();
+        Object result = null;
+        CallToolResult answer = null;
         try {
-            Object result = handler.handle(a, request.arguments() == null ? Map.of() : request.arguments());
-            success = true;
-            return CallToolResult.builder().addTextContent(objectMapper.writeValueAsString(result)).isError(false).build();
+            result = handler.handle(a, arguments);
+            return answer = CallToolResult.builder().addTextContent(objectMapper.writeValueAsString(result)).isError(false).build();
         } catch (ToolException e) {
-            return error(e.getMessage());
+            return answer = error(e.getMessage());
         } catch (ConnectorHub.NoInstanceConnectedException e) {
-            return error(e.getMessage() + " Start the application with the JobRunr dashboard enabled and the connector token set "
+            return answer = error(e.getMessage() + " Start the application with the JobRunr dashboard enabled and the connector token set "
                     + "(jobrunr.dashboard.mcp.token), see https://mcp.jobrunr.io/account.");
         } catch (DashboardClient.DashboardException e) {
-            return error(e.status() == 404 ? "Not found: " + e.getMessage() : readOnlyHint(e.getMessage()));
+            return answer = error(e.status() == 404 ? "Not found: " + e.getMessage() : readOnlyHint(e.getMessage()));
         } catch (RuntimeException e) {
-            if (e.getCause() instanceof ConnectorHub.InstanceTimeoutException timeout) return error(timeout.getMessage());
+            if (e.getCause() instanceof ConnectorHub.InstanceTimeoutException timeout) return answer = error(timeout.getMessage());
             log.warn("Tool {} failed", name, e);
-            return error(e instanceof ConnectorHub.InstanceTimeoutException ? e.getMessage() : "The tool failed: " + e.getMessage());
+            return answer = error(e instanceof ConnectorHub.InstanceTimeoutException ? e.getMessage() : "The tool failed: " + e.getMessage());
         } finally {
-            recordToolCall(a, name, success, (System.nanoTime() - start) / 1_000_000, exchange);
+            boolean success = answer != null && !Boolean.TRUE.equals(answer.isError());
+            String errorMessage = answer == null || success ? null : errorText(answer);
+            recordToolCall(a, name, arguments, result, success, errorMessage, (System.nanoTime() - start) / 1_000_000, exchange);
         }
     }
 
-    private void recordToolCall(Account account, String name, boolean success, long latencyMs, McpSyncServerExchange exchange) {
+    private void recordToolCall(Account account, String name, Map<String, Object> arguments, Object result, boolean success,
+                                String errorMessage, long latencyMs, McpSyncServerExchange exchange) {
+        Object userAgent = exchange.transportContext().get(USER_AGENT_KEY);
+        String ua = userAgent == null ? null : userAgent.toString();
         try {
-            Object userAgent = exchange.transportContext().get(USER_AGENT_KEY);
-            store.recordToolCall(account.id(), name, success, latencyMs, userAgent == null ? null : userAgent.toString());
+            store.recordToolCall(account.id(), name, success, latencyMs, ua);
         } catch (Exception e) {
             log.warn("Could not record tool call {}: {}", name, e.toString());
         }
+        try {
+            RequestContextHolder.RequestContext rc = RequestContextHolder.peek();
+            queryLogClient.fireAndForget(QueryLogEntry.forAccount(QueryLogEntry.SOURCE_OPS, name, account, logArguments(arguments),
+                    logMetadata(result), success, errorMessage, latencyMs, rc != null ? rc.clientIp() : null,
+                    ua != null ? ua : rc != null ? rc.userAgent() : null, serverVersion));
+        } catch (Exception e) {
+            log.warn("Could not log tool call {} to the attribution tool: {}", name, e.toString());
+        }
+    }
+
+    private static final Set<String> LOGGED_ARGUMENTS = Set.of("state", "offset", "limit", "max_jobs", "dry_run", "problem_type");
+
+    /**
+     * The shape of the call, not its subject: job ids, recurring job ids and search text name the user's jobs and stay here.
+     * A list of job ids becomes its size.
+     */
+    private static Map<String, Object> logArguments(Map<String, Object> arguments) {
+        Map<String, Object> logged = new LinkedHashMap<>();
+        arguments.forEach((key, value) -> {
+            if (LOGGED_ARGUMENTS.contains(key)) logged.put(key, value);
+        });
+        if (arguments.get("job_ids") instanceof Collection<?> ids) logged.put("job_ids_count", ids.size());
+        return logged;
+    }
+
+    private static final Set<String> LOGGED_STRINGS = Set.of("state", "feature", "jobrunrVersion", "jobParameterValues");
+
+    /**
+     * Numbers, flags and sizes only: counts, versions, the Pro flag. Job names, exceptions, server names and ids are the user's
+     * data and are not sent.
+     */
+    private static Map<String, Object> logMetadata(Object result) {
+        if (!(result instanceof Map<?, ?> map)) return null;
+        Map<String, Object> metadata = new LinkedHashMap<>();
+        map.forEach((k, value) -> {
+            String key = String.valueOf(k);
+            if (value instanceof Boolean || value instanceof Number) metadata.put(key, value);
+            else if (value instanceof String s && LOGGED_STRINGS.contains(key)) metadata.put(key, s);
+            else if (value instanceof Collection<?> c) metadata.put(key + "_count", c.size());
+            else if (value instanceof JsonNode node && node.isArray()) metadata.put(key + "_count", node.size());
+            else if (value instanceof Map<?, ?> m && !m.isEmpty() && m.values().stream().allMatch(v -> v == null || v instanceof Number)) metadata.put(key, m);
+        });
+        return metadata.isEmpty() ? null : metadata;
+    }
+
+    private static String errorText(CallToolResult answer) {
+        return answer.content().stream()
+                .filter(McpSchema.TextContent.class::isInstance)
+                .map(c -> ((McpSchema.TextContent) c).text())
+                .findFirst()
+                .map(text -> text.length() > 500 ? text.substring(0, 500) : text)
+                .orElse(null);
     }
 
     private static String readOnlyHint(String message) {

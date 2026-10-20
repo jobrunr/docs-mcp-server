@@ -108,7 +108,7 @@ public class InstanceMonitor {
                 counts[0], counts[1], counts[2], counts[3], counts[4], null, Instant.now()));
 
         if (first || !store.hasLeadEvent(account.id(), LeadEvents.FIRST_CONNECTION)) {
-            leadEvents.record(account, LeadEvents.FIRST_CONNECTION, "JobRunr " + info.jobrunrVersion() + ", " + info.framework()
+            leadEvents.record(clusterId != null ? account.withClusterId(clusterId) : account, LeadEvents.FIRST_CONNECTION, "JobRunr " + info.jobrunrVersion() + ", " + info.framework()
                     + ", " + (servers != null ? servers.size() : 0) + " servers, " + total(recurringJobs) + " recurring jobs");
         }
     }

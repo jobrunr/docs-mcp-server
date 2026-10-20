@@ -92,8 +92,14 @@ The same server is also the hub of the hosted JobRunr MCP for JobRunr OSS users.
 
 Accounts, SHA-256 hashes of tokens, sign-in links and sessions, one snapshot per account (versions, job counts,
 servers), tool call rows (tool name, success, latency, user agent) and lead events. Never tool arguments, tool
-results or job data. Ops tool calls do not go to the attribution DB `mcp_query_log`, so the docs usage numbers stay
-clean.
+results or job data.
+
+Ops tool calls and lead events also go to the attribution DB `mcp_query_log`, marked `source = "ops"` and
+`source = "hub"` (tool `hub_<event>`) so the docs usage numbers stay separate. Each row names the account by email
+domain, company and cluster id, never the full address. Ops rows carry the shape of the call, not its subject: only
+`state`, `offset`, `limit`, `max_jobs`, `dry_run`, `problem_type` and the number of job ids, never job ids, recurring
+job ids or search text. Results are reduced to numbers, flags and sizes (job counts, JobRunr version, `proFeature`);
+no result body is sent.
 
 ### Try it locally
 

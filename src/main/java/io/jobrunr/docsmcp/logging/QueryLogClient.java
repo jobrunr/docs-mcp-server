@@ -55,6 +55,15 @@ public class QueryLogClient {
         body.put("user_agent", entry.userAgent());
         body.put("mcp_server_version", entry.mcpServerVersion());
         body.put("occurred_at", entry.occurredAt() != null ? entry.occurredAt().toString() : null);
+        body.put("source", entry.source());
+        if (entry.accountId() != null) {
+            Map<String, Object> account = new LinkedHashMap<>();
+            account.put("id", entry.accountId());
+            account.put("email_domain", entry.accountEmailDomain());
+            account.put("company", entry.accountCompany());
+            account.put("cluster_id", entry.clusterId());
+            body.put("account", account);
+        }
 
         webClient.post()
                 .uri(url)

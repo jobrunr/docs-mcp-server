@@ -113,7 +113,7 @@ public class AccountController {
                 return ResponseEntity.status(HttpStatus.GONE).body(Map.<String, Object>of("error", "This sign-in link has expired or was already used. Request a new one."));
             }
             if (store.markVerified(account.get().id())) {
-                leadEvents.record(account.get(), LeadEvents.VERIFIED, account.get().useCase());
+                leadEvents.record(account.get(), LeadEvents.VERIFIED, account.get().useCase(), ClientIpExtractor.from(exchange.getRequest()));
             }
             String session = store.createSession(account.get().id(), properties.sessionTtl());
             exchange.getResponse().addCookie(ResponseCookie.from(SESSION_COOKIE, session)

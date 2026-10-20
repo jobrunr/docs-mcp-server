@@ -3,8 +3,11 @@ package io.jobrunr.docsmcp.hub.leads;
 import io.jobrunr.docsmcp.hub.HubProperties;
 import io.jobrunr.docsmcp.hub.account.Account;
 import io.jobrunr.docsmcp.hub.account.AccountStore;
+import io.jobrunr.docsmcp.logging.QueryLogClient;
+import io.jobrunr.docsmcp.logging.QueryLogEntry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
@@ -18,7 +21,7 @@ import java.util.Map;
 /**
  * The sales side of the hub. Every signal lands in {@code hub_lead_events}; when {@code hub.leads-webhook-url} is set it
  * is also posted to n8n, which creates or updates the HubSpot contact (form {@code mcp-ops-*}, like the trial tool's
- * {@code mcp-trial}).
+ * {@code mcp-trial}), and logged to the attribution tool as tool {@code hub_<event>} with the account's email domain.
  */
 @Component
 public class LeadEvents {
@@ -31,17 +34,28 @@ public class LeadEvents {
     private static final Logger log = LoggerFactory.getLogger(LeadEvents.class);
 
     private final AccountStore store;
+    private final QueryLogClient queryLogClient;
+    private final String serverVersion;
     private final WebClient webClient = WebClient.builder().build();
     private final String webhookUrl;
 
-    public LeadEvents(AccountStore store, HubProperties properties) {
+    public LeadEvents(AccountStore store, HubProperties properties, QueryLogClient queryLogClient,
+                      @Value("${spring.ai.mcp.server.version:unknown}") String serverVersion) {
         this.store = store;
+        this.queryLogClient = queryLogClient;
+        this.serverVersion = serverVersion;
         this.webhookUrl = properties.leadsWebhookUrl();
     }
 
     public void record(Account account, String event, String detail) {
+        record(account, event, detail, null);
+    }
+
+    /** @param clientIp the browser or agent that caused the event, when there is one; never the user's application */
+    public void record(Account account, String event, String detail, String clientIp) {
         store.recordLeadEvent(account.id(), event, detail);
         log.info("Lead event {} for {} ({})", event, account.emailDomain(), detail);
+        logToAttribution(account, event, detail, clientIp);
         if (webhookUrl == null || webhookUrl.isBlank()) return;
 
         Map<String, Object> body = new LinkedHashMap<>();
@@ -61,5 +75,17 @@ public class LeadEvents {
                 .onErrorResume(e -> Mono.empty())
                 .subscribeOn(Schedulers.boundedElastic())
                 .subscribe();
+    }
+
+    private void logToAttribution(Account account, String event, String detail, String clientIp) {
+        try {
+            Map<String, Object> arguments = new LinkedHashMap<>();
+            arguments.put("detail", detail != null && detail.length() > 200 ? detail.substring(0, 200) : detail);
+            if (VERIFIED.equals(event)) arguments.put("role", account.role());
+            queryLogClient.fireAndForget(QueryLogEntry.forAccount(QueryLogEntry.SOURCE_HUB, "hub_" + event, account, arguments,
+                    null, true, null, 0, clientIp, null, serverVersion));
+        } catch (Exception e) {
+            log.warn("Could not log lead event {} to the attribution tool: {}", event, e.toString());
+        }
     }
 }
