@@ -5,8 +5,8 @@ spring:
   application:
     name: jobrunr-docs-mcp
   codec:
-    # connector results (job pages with stack traces) can be well above the 256 KB default
-    max-in-memory-size: 16MB
+    # Connector results are bounded to 4 MiB by the controller; allow small framing overhead.
+    max-in-memory-size: 5MB
   datasource:
     url: ${HUB_DB_URL:jdbc:h2:file:./data/hub/hub}
     username: ${HUB_DB_USERNAME:sa}
@@ -19,9 +19,7 @@ spring:
       server:
         name: jobrunr-docs
         version: 0.2.0
-        # Streamable HTTP (single POST endpoint) is what current MCP clients speak.
-        # The deprecated HTTP+SSE pair (/sse + /mcp/message) is kept alive alongside it
-        # by LegacySseTransportConfig for clients installed before this change.
+        # Current MCP clients use Streamable HTTP at one endpoint.
         protocol: streamable
         streamable-http:
           mcp-endpoint: /mcp
@@ -56,13 +54,13 @@ docs:
   reindex-secret: ${MCP_REINDEX_SECRET:}
 
 trial:
-  webhook-url: ${TRIAL_WEBHOOK_URL:https://n8n.srv851199.hstgr.cloud/webhook/f7a5e38e-4b1d-4f5b-b534-e014ff6b80fe}
+  webhook-url: ${TRIAL_WEBHOOK_URL:}
   timeout: ${TRIAL_TIMEOUT:PT10S}
 
 log:
   api:
-    url: ${MCP_LOG_API_URL:https://ping.jobrunr.io/api_log_mcp_query.php}
-    secret: ${MCP_LOG_API_SECRET:JobRunr_S3cr3t_Key_2026!}
+    url: ${MCP_LOG_API_URL:}
+    secret: ${MCP_LOG_API_SECRET:}
     timeout: ${MCP_LOG_API_TIMEOUT:PT5S}
     body-truncate-bytes: ${MCP_LOG_BODY_TRUNCATE:2048}
 
@@ -75,6 +73,12 @@ hub:
   magic-link-ttl: PT30M
   session-ttl: P30D
   snapshot-interval: PT10M
+
+mcp:
+  sessions:
+    # Separate caps apply to public docs and authenticated operations transports.
+    max: ${MCP_MAX_SESSIONS:2000}
+    idle-timeout: ${MCP_SESSION_IDLE_TIMEOUT:PT1H}
 
 ratelimit:
   enabled: ${RATELIMIT_ENABLED:false}

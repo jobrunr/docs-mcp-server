@@ -29,7 +29,7 @@ import java.util.Map;
 /**
  * The ops MCP server: a second {@link McpSyncServer} in this application, reached through {@code /mcp} with an agent
  * token (see {@link AgentAuthWebFilter}). It serves the docs tools of the primary server plus {@link OpsTools}.
- * Built by hand like the legacy SSE server, and for the same reason: Spring AI autoconfigures exactly one server.
+ * Built separately because Spring AI autoconfigures exactly one server.
  */
 @Configuration
 public class OpsMcpServerConfig {
@@ -62,12 +62,16 @@ public class OpsMcpServerConfig {
             McpSyncServer primaryServer,
             ObjectProvider<List<SyncToolSpecification>> docsTools,
             OpsTools opsTools,
-            @Value("${spring.ai.mcp.server.streamable-http.keep-alive-interval:25s}") Duration keepAliveInterval) {
+            @Value("${spring.ai.mcp.server.streamable-http.keep-alive-interval:25s}") Duration keepAliveInterval,
+            @Value("${mcp.sessions.max:2000}") long maxSessions,
+            @Value("${mcp.sessions.idle-timeout:PT1H}") Duration sessionIdleTimeout) {
 
         WebFluxStreamableServerTransportProvider provider = WebFluxStreamableServerTransportProvider.builder()
                 .jsonMapper(new JacksonMcpJsonMapper(mcpServerJsonMapper))
                 .messageEndpoint(AgentAuthWebFilter.OPS_ENDPOINT)
                 .keepAliveInterval(keepAliveInterval)
+                .maxSessions(maxSessions)
+                .sessionIdleTimeout(sessionIdleTimeout)
                 .contextExtractor(request -> {
                     Map<String, Object> context = new HashMap<>();
                     request.attribute(AgentAuthWebFilter.ACCOUNT_ATTRIBUTE)

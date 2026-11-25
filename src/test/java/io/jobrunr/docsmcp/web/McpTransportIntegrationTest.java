@@ -3,8 +3,10 @@ package io.jobrunr.docsmcp.web;
 import io.jobrunr.docsmcp.index.DocsRegistry;
 import io.jobrunr.docsmcp.index.LuceneIndex;
 import io.jobrunr.docsmcp.index.VectorIndex;
+import io.jobrunr.docsmcp.hub.mcp.OpsMcpServerConfig;
 import io.jobrunr.docsmcp.model.DocsCatalog;
 import io.jobrunr.docsmcp.testsupport.DeterministicEmbeddingModel;
+import org.springframework.ai.mcp.server.webflux.transport.WebFluxStreamableServerTransportProvider;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.embedding.EmbeddingModel;
@@ -16,24 +18,19 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.reactive.server.EntityExchangeResult;
 import org.springframework.test.web.reactive.server.WebTestClient;
-import reactor.core.Disposable;
-import reactor.test.StepVerifier;
+import org.springframework.test.util.ReflectionTestUtils;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.InputStream;
 import java.time.Duration;
 import java.util.List;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Covers the wire protocol of both transports the server speaks:
- * Streamable HTTP at {@code /mcp} (what current clients use) and the deprecated
- * HTTP+SSE pair at {@code /sse} + {@code /mcp/message} (older installs).
+ * Covers the Streamable HTTP wire protocol at {@code /mcp}.
  *
  * The regression this guards against is the whole reason for the Spring AI 2.0 upgrade:
  * a POST to the MCP endpoint used to return 405 Method Not Allowed.
@@ -48,8 +45,6 @@ import static org.assertj.core.api.Assertions.assertThat;
         "log.api.url=",
         "trial.webhook-url=http://127.0.0.1:1/none",
         "ratelimit.enabled=false",
-        // Prove the keep-alive fires without spending 25 s of build time waiting for it.
-        "mcp.legacy-sse.keep-alive-interval=1s",
         "spring.ai.mcp.server.streamable-http.keep-alive-interval=1s",
 })
 class McpTransportIntegrationTest {
@@ -77,6 +72,12 @@ class McpTransportIntegrationTest {
 
     @Autowired
     private VectorIndex vectorIndex;
+
+    @Autowired
+    private WebFluxStreamableServerTransportProvider publicTransport;
+
+    @Autowired
+    private OpsMcpServerConfig.OpsMcpEndpoint opsEndpoint;
 
     /** The real loader is pointed at a missing file, so seed the indexes from the bundled sample. */
     @BeforeEach
@@ -160,91 +161,39 @@ class McpTransportIntegrationTest {
                 .expectStatus().isOk();
     }
 
-    // ------------------------------------------------------------------- legacy
-
     @Test
-    void legacySseEndpointStillAdvertisesItsMessageEndpoint() {
-        List<String> events = client.get().uri("/sse")
-                .accept(MediaType.TEXT_EVENT_STREAM)
-                .exchange()
-                .expectStatus().isOk()
-                .returnResult(String.class)
-                .getResponseBody()
-                .take(1)
-                .collectList()
-                .block(Duration.ofSeconds(20));
+    void deletedPublicSessionIsRemovedFromTransportMap() {
+        String session = openSession();
+        @SuppressWarnings("unchecked")
+        Map<String, ?> sessions = (Map<String, ?>) ReflectionTestUtils.getField(publicTransport, "sessions");
+        assertThat(sessions).containsKey(session);
 
-        assertThat(events).isNotNull().hasSize(1);
-        assertThat(events.get(0)).contains("/mcp/message").contains("sessionId=");
-    }
-
-    @Test
-    void legacySseStreamStaysOpenAndPings() {
-        // keep-alive replaced the hand-rolled SseKeepAliveFilter; the SDK pings instead.
-        StepVerifier.create(client.get().uri("/sse")
-                        .accept(MediaType.TEXT_EVENT_STREAM)
-                        .exchange()
-                        .returnResult(String.class)
-                        .getResponseBody()
-                        .take(2))
-                .expectNextMatches(e -> e.contains("/mcp/message"))
-                .expectNextMatches(e -> e.contains("\"method\":\"ping\""))
-                .expectComplete()
-                .verify(Duration.ofSeconds(45));
-    }
-
-    @Test
-    void legacyTransportCompletesAFullHandshakeAndExposesTheSameTools() throws Exception {
-        // A legacy client holds GET /sse open for the whole session and POSTs alongside it;
-        // dropping the stream drops the session, so keep the subscription alive throughout.
-        BlockingQueue<String> events = new LinkedBlockingQueue<>();
-        Disposable subscription = client.get().uri("/sse")
-                .accept(MediaType.TEXT_EVENT_STREAM)
-                .exchange()
-                .returnResult(String.class)
-                .getResponseBody()
-                .subscribe(events::add);
-
-        try {
-            String endpoint = events.poll(20, TimeUnit.SECONDS);
-            assertThat(endpoint).as("endpoint event").isNotNull().contains("/mcp/message");
-            String messageUri = endpoint.substring(endpoint.indexOf("/mcp/message"));
-
-            postToLegacy(messageUri, INITIALIZE);
-            JsonNode initResult = MAPPER.readTree(nextNonPing(events)).path("result");
-            assertThat(initResult.path("serverInfo").path("name").stringValue()).isEqualTo("jobrunr-docs");
-
-            postToLegacy(messageUri, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
-            postToLegacy(messageUri, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}");
-
-            JsonNode tools = MAPPER.readTree(nextNonPing(events)).path("result").path("tools");
-            List<String> legacyNames = tools.valueStream().map(t -> t.path("name").stringValue()).toList();
-
-            assertThat(legacyNames).containsExactlyInAnyOrderElementsOf(toolNamesOverStreamableHttp());
-            assertThat(legacyNames).containsExactlyInAnyOrder(
-                    "search_jobrunr_docs", "fetch_jobrunr_doc",
-                    "list_jobrunr_doc_sections", "request_jobrunr_pro_trial");
-        } finally {
-            subscription.dispose();
-        }
-    }
-
-    private void postToLegacy(String messageUri, String body) {
-        client.post().uri(messageUri)
-                .contentType(MediaType.APPLICATION_JSON)
-                .bodyValue(body)
+        client.delete().uri("/mcp")
+                .header("MCP-Protocol-Version", PROTOCOL)
+                .header("Mcp-Session-Id", session)
                 .exchange()
                 .expectStatus().is2xxSuccessful();
+
+        assertThat(sessions).doesNotContainKey(session);
     }
 
-    /** Keep-alive pings share the stream with responses; skip them. */
-    private static String nextNonPing(BlockingQueue<String> events) throws InterruptedException {
-        for (int i = 0; i < 5; i++) {
-            String event = events.poll(30, TimeUnit.SECONDS);
-            assertThat(event).as("expected a JSON-RPC message on the SSE stream").isNotNull();
-            if (!event.contains("\"method\":\"ping\"")) return event;
-        }
-        throw new AssertionError("only pings arrived on the SSE stream");
+    @Test
+    void bothMcpTransportsHaveSessionCapsAndIdleExpiry() {
+        assertThat(ReflectionTestUtils.getField(publicTransport, "maxSessions")).isEqualTo(2000L);
+        assertThat(ReflectionTestUtils.getField(publicTransport, "sessionIdleTimeout")).isEqualTo(Duration.ofHours(1));
+        Object opsTransport = ReflectionTestUtils.getField(opsEndpoint, "provider");
+        assertThat(ReflectionTestUtils.getField(opsTransport, "maxSessions")).isEqualTo(2000L);
+        assertThat(ReflectionTestUtils.getField(opsTransport, "sessionIdleTimeout")).isEqualTo(Duration.ofHours(1));
+    }
+
+    @Test
+    void oldSseEndpointsAreGone() {
+        client.get().uri("/sse").exchange().expectStatus().isNotFound();
+        client.post().uri("/mcp/message?sessionId=test")
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{}")
+                .exchange()
+                .expectStatus().isNotFound();
     }
 
     // -------------------------------------------------------------------- helpers

@@ -14,10 +14,8 @@ The server speaks **Streamable HTTP** at `/mcp` — the transport every current 
 JSON-RPC message is its own HTTP POST. It negotiates protocol versions `2024-11-05` through `2025-11-25`;
 newer clients negotiate down to `2025-11-25`.
 
-The deprecated **HTTP+SSE** transport (`GET /sse` + `POST /mcp/message`, protocol `2024-11-05`) still runs
-alongside it so clients installed before Streamable HTTP landed keep working. It is deprecated upstream and
-will be removed once that traffic stops — new installs should use `/mcp`. Set `MCP_LEGACY_SSE_ENABLED=false`
-to switch it off.
+The retired HTTP+SSE endpoints (`/sse` and `/mcp/message`) are no longer served. Existing clients
+configured with `/sse` must be pointed at `/mcp`.
 
 ## Tools
 
@@ -147,8 +145,8 @@ claude mcp add --transport http jobrunr-docs https://mcp.jobrunr.io/mcp
 
 Restart Claude Code, then ask about anything JobRunr-related. Run `/mcp` inside Claude Code to confirm the connection.
 
-If you added this server before August 2026 you'll have it on the old SSE URL. That still works, but re-add it
-to move to the current transport: `claude mcp remove jobrunr-docs` then the command above.
+If an older installation still uses the retired `/sse` URL, re-add it with
+`claude mcp remove jobrunr-docs` followed by the command above.
 
 ### Cursor
 
@@ -241,7 +239,6 @@ Tests use the bundled `src/test/resources/sample-docs.json` so they don't depend
             │
             ▼
    Streamable HTTP /mcp   ──►  Claude Code / Cursor / ...
-   (+ deprecated /sse)
 ```
 
 The server **never generates answers** — it surfaces relevant pages and lets the client LLM synthesize. Stateless apart from the in-memory indexes.
@@ -252,14 +249,10 @@ The server **never generates answers** — it surfaces relevant pages and lets t
 |---|---|
 | `POST /mcp` | **MCP Streamable HTTP endpoint** — every JSON-RPC message. What clients should use. |
 | `GET /mcp` | Standalone SSE stream for server-initiated messages (same session) |
-| `GET /sse` | _Deprecated_ HTTP+SSE entry, kept for clients installed before Streamable HTTP |
-| `POST /mcp/message?sessionId=…` | _Deprecated_ JSON-RPC messages for the above (advertised over SSE) |
 | `GET /actuator/health` | Liveness + readiness |
 | `POST /admin/reindex` | Force reload of `docs.json` (HMAC headers required) |
 
-Both transports are served by the same application on the same port and expose the same tools — the legacy
-one runs as a second in-process MCP server (`LegacySseTransportConfig`) sharing the primary server's tool
-specifications and capabilities. Idle streams are kept alive by protocol-level `ping` messages every 25 s.
+Idle Streamable HTTP streams are kept alive by protocol-level `ping` messages every 25 s.
 
 `/admin/reindex` requires two headers:
 
@@ -279,9 +272,12 @@ The JobRunr website's GitHub Actions deploy step builds these automatically (see
 | `DOCS_MANIFEST_URL` | website `manifest.json` | Where to fetch the manifest (used to detect changes) |
 | `DOCS_POLL_INTERVAL` | `PT15M` | ISO-8601 duration for the scheduled poll |
 | `MCP_REINDEX_SECRET` | _(empty)_ | HMAC secret for `/admin/reindex`. If empty, the endpoint returns 503. |
-| `TRIAL_WEBHOOK_URL` | n8n webhook | Where `request_jobrunr_pro_trial` POSTs trial submissions. |
+| `TRIAL_WEBHOOK_URL` | _(empty)_ | Required to submit trials; no receiver is embedded in source. |
 | `TRIAL_TIMEOUT` | `PT10S` | Webhook call timeout. |
-| `MCP_LEGACY_SSE_ENABLED` | `true` | Serve the deprecated `/sse` transport alongside `/mcp`. Set `false` to retire it. |
+| `MCP_LOG_API_URL` | _(empty)_ | Optional attribution log receiver. Set with `MCP_LOG_API_SECRET` to enable logging. |
+| `MCP_LOG_API_SECRET` | _(empty)_ | Secret for the attribution log receiver; never store a live value in source. |
+| `MCP_MAX_SESSIONS` | `2000` | Maximum MCP sessions for each of the public and ops transports. |
+| `MCP_SESSION_IDLE_TIMEOUT` | `PT1H` | Idle MCP session eviction; must exceed the 25 s keep-alive interval. |
 | `RATELIMIT_ENABLED` | `false` | Per-IP rate limiting. See the caveat below before enabling. |
 | `HUB_PUBLIC_URL` | `https://mcp.jobrunr.io` | Base url in sign-in emails and setup snippets |
 | `HUB_DB_URL` | `jdbc:h2:file:./data/hub/hub` | Hub database (H2 file or PostgreSQL) |
@@ -291,9 +287,9 @@ The JobRunr website's GitHub Actions deploy step builds these automatically (see
 | `HUB_POLL_HOLD` | `PT25S` | How long a connector long-poll is held open |
 | `HUB_REQUEST_TIMEOUT` | `PT20S` | How long an agent waits for the connected instance |
 
-> **Rate limiting caveat.** Under Streamable HTTP every tool call is its own POST, whereas the old SSE
-> transport counted one long-lived GET per session. The existing 10 requests/minute default is therefore far
-> more aggressive than it used to be — retune `RATELIMIT_RPM` before turning `RATELIMIT_ENABLED` on.
+> **Rate limiting caveat.** Under Streamable HTTP every tool call is its own POST. The existing
+> 10 requests/minute default can be too aggressive for incident work; retune `RATELIMIT_RPM`
+> before turning `RATELIMIT_ENABLED` on.
 
 ## Things still to do before this is "production"
 
