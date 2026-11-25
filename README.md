@@ -10,9 +10,10 @@ Built on Spring Boot 4.1 + Spring AI 2.0's MCP server starter + Apache Lucene (B
 
 ### Transports
 
-The server speaks **Streamable HTTP** at `/mcp` — the transport every current MCP client uses, where each
-JSON-RPC message is its own HTTP POST. It negotiates protocol versions `2024-11-05` through `2025-11-25`;
-newer clients negotiate down to `2025-11-25`.
+The server speaks **Streamable HTTP** at `/mcp`. Public documentation calls are stateless: they do not
+issue or retain MCP session IDs, so anonymous initialization cannot fill a shared session table.
+Requests with a valid agent token use a separate stateful operations server with a configurable
+session cap and idle expiry. Both negotiate protocol versions through `2025-11-25`.
 
 The retired HTTP+SSE endpoints (`/sse` and `/mcp/message`) are no longer served. Existing clients
 configured with `/sse` must be pointed at `/mcp`.
@@ -43,25 +44,27 @@ The same server is also the hub of the hosted JobRunr MCP for JobRunr OSS users.
 `Strategy/plans/jobrunr-mcp-ops-server-plan.md` in the Second Brain repo.
 
 ```
- Claude Code / Cursor ──POST /mcp + Bearer jra_…──►  this server (hub)  ◄──long-poll /connector/poll──  JobRunr dashboard
+ Claude Code / Cursor ──POST /mcp + Bearer jra_…──►  this server (hub)  ◄──long-poll /connector/poll──  jobrunr-mcp plugin
                                                      tools, triage,          + POST /connector/results      (customer JVM)
-                                                     previews, accounts      ── outbound only ──            connector: scope check,
-                                                                                                             redaction, local API call
+                                                     previews, accounts      ── outbound only ──            in-process dashboard API
 ```
 
-* **One URL, two servers.** `/mcp` without an agent token is the docs server, unchanged. With
+* **One URL, two servers.** `/mcp` without an agent token is the stateless docs server. With
   `Authorization: Bearer jra_…`, `AgentAuthWebFilter` routes the request to a second MCP server (`OpsMcpServerConfig`)
   that serves the docs tools plus the cluster tools in `OpsTools`.
-* **The hub does the thinking, the connector relays.** Every tool turns into dashboard REST calls (`/api/jobs`,
-  `/api/servers`, …). Aggregation such as `get_cluster_overview`, `triage_failed_jobs` and the two-step
-  `requeue_jobs` preview runs here. The connector in JobRunr core (`org.jobrunr.dashboard.mcp.McpHubConnector`,
-  branch `feat/mcp-hub-connector` of jobrunr/jobrunr) only long-polls, calls its own dashboard on 127.0.0.1 and posts
-  the answer back.
-* **Safety lives at the edge.** The connector only reaches `/api/*`, refuses mutating routes unless its token starts
-  with `jrc_operate_`, and replaces job parameter values with `<redacted>` before anything leaves the JVM. A
-  compromised hub cannot do more than the token in the customer's config allows.
-* **Free tier: one cluster per account at a time.** A second cluster connecting while the linked one answers gets a
-  409 and a `second_cluster_attempt` lead event. A new cluster whose predecessor is gone (fresh database) takes over.
+* **The hub does the thinking, the connector relays.** Every tool turns into an allowed dashboard API call
+  (`/api/jobs`, `/api/servers`, …). Aggregation such as `get_cluster_overview`, `triage_failed_jobs` and
+  two-step `requeue_jobs` previews runs here. The `org.jobrunr:jobrunr-mcp` plugin long-polls the hub,
+  invokes JobRunr's API handler in-process, and posts the response. No dashboard web port is needed.
+* **The connector enforces the route and token scope.** It accepts only routes used by the current MCP tools
+  and rejects mutating requests when configured with a read-only connector token. The hub also checks the
+  authenticated connector scope before routing mutations and binds results to the selected account and node.
+  The OSS connector sends job parameter values as stored, including possible personal data. Pro redaction
+  depends on a separate proprietary runtime and is not provided by this OSS connector.
+* **Free tier: one cluster and two concurrently live nodes per account.** An extra cluster receives a 409
+  while the linked cluster is live. Once the old cluster has disconnected, a new OSS cluster can claim the
+  account's one slot. JobRunr Pro accounts can connect unlimited nodes and clusters; pass `cluster_id` from
+  `list_clusters` to target an online cluster. The hub never falls back to another cluster for a selected ID.
 
 ### Cluster tools
 
@@ -74,7 +77,8 @@ The same server is also the hub of the hosted JobRunr MCP for JobRunr OSS users.
 | `list_recurring_jobs`, `list_servers`, `get_problems` | As named |
 | `requeue_job`, `delete_job`, `trigger_recurring_job`, `dismiss_problem` | Operate tools, need an operate connector token |
 | `requeue_jobs(job_ids, dry_run, preview_id)` | Bulk requeue, max 100: dry run returns a `preview_id`, execution needs it |
-| `list_clusters`, `search_jobs` | Pro hooks: multi-cluster and job search answer with `proFeature: true` and record a lead event |
+| `list_clusters` | Lists this account's connected clusters. Pro accounts can pass a listed `cluster_id` to every cluster tool; OSS uses its single default cluster. |
+| `search_jobs` | Pro feature hook; returns a `proFeature` hint. |
 
 ### Pages and endpoints
 
@@ -88,9 +92,9 @@ The same server is also the hub of the hosted JobRunr MCP for JobRunr OSS users.
 
 ### What the hub stores
 
-Accounts, SHA-256 hashes of tokens, sign-in links and sessions, one snapshot per account (versions, job counts,
-servers), tool call rows (tool name, success, latency, user agent) and lead events. Never tool arguments, tool
-results or job data.
+Accounts, SHA-256 hashes of tokens, sign-in links and sessions, one snapshot per connected cluster
+(versions, job counts, servers), tool call rows (tool name, success, latency, user agent) and lead events.
+It does not persist tool arguments, tool results or job data.
 
 Ops tool calls and lead events also go to the attribution DB `mcp_query_log`, marked `source = "ops"` and
 `source = "hub"` (tool `hub_<event>`) so the docs usage numbers stay separate. Each row names the account by email
@@ -103,7 +107,7 @@ no result body is sent.
 
 ```bash
 docker run -d --name mcp-mailpit -p 1025:1025 -p 8025:8025 axllent/mailpit      # catches the sign-in emails
-PORT=18080 MCP_LOG_API_URL= TRIAL_WEBHOOK_URL=http://127.0.0.1:1/none \
+PORT=18080 MCP_LOG_API_URL= TRIAL_WEBHOOK_URL= HUB_LEADS_WEBHOOK_URL= \
 HUB_PUBLIC_URL=http://localhost:18080 SPRING_MAIL_HOST=localhost SPRING_MAIL_PORT=1025 \
 DOCS_URL=file://$PWD/data/docs.json DOCS_MANIFEST_URL=file://$PWD/data/manifest.json \
 java -jar target/jobrunr-docs-mcp-0.2.0-SNAPSHOT.jar
@@ -111,8 +115,13 @@ java -jar target/jobrunr-docs-mcp-0.2.0-SNAPSHOT.jar
 
 Keep `MCP_LOG_API_URL` empty locally, otherwise local tool calls land in the production attribution DB. Sign up at
 http://localhost:18080/signup, open the email at http://localhost:8025, create tokens, then start
-`~/jobrunr-mcp-demo` with the connector token (see its README). Without SMTP settings the sign-in link is written to
-the log instead.
+`~/jobrunr-mcp-demo` with the connector token (see its README). Account signup and sign-in
+require SMTP; without it these endpoints return 503 and do not create a usable link.
+
+If `POST /api/signin` returns 200 but no message arrives, the generic response may mean the
+address does not match an existing account. Check that the persistent `/app/data` volume and
+`HUB_DB_URL` still point to the database where the account was created. A 429 means the mail
+cooldown is active; 502 or 503 indicates mail delivery or configuration trouble.
 
 ### Deploying the ops hub (Coolify)
 
@@ -122,8 +131,7 @@ same way as the finance demo and the audit app. A push to `main` deploys. Before
 1. **Mail.** Copy the SMTP variables from the finance demo (`finance.demo.jobrunr.io`) to this app in Coolify:
    `SPRING_MAIL_HOST`, `SPRING_MAIL_PORT`, `SPRING_MAIL_USERNAME`, `SPRING_MAIL_PASSWORD` and
    `SPRING_MAIL_PROPERTIES_MAIL_SMTP_STARTTLS_ENABLE=true`. The hub sends as `noreply@jobrunr.io`, like the tour
-   (`HUB_MAIL_FROM` overrides it). Without these, `/api/signup` answers 503 "signups are paused" and the link is only
-   written to the container log.
+   (`HUB_MAIL_FROM` overrides it). Without these, `/api/signup` answers 503 before creating or sending a link.
 2. **Persistent storage.** Add a volume mount at `/app/data` (Coolify: Storages, volume mount). The image creates
    that directory owned by the app user, so a new named volume takes over the ownership. Without it every deploy
    wipes accounts and tokens, and every customer's connector token stops working.
@@ -131,7 +139,27 @@ same way as the finance demo and the audit app. A push to `main` deploys. Before
 4. **Leads.** `HUB_LEADS_WEBHOOK_URL` for the n8n workflow that upserts the HubSpot contact. Payload: `form`
    (`mcp-ops-verified`, `mcp-ops-first-connection`, `mcp-ops-pro-feature-attempt`, `mcp-ops-second-cluster-attempt`),
    `email`, `name`, `company`, `role`, `use_case`, `detail`, `source=mcp-ops`.
-5. **Privacy page and DPA** before public signups (plan section 5).
+5. **Optional receivers.** Set `TRIAL_WEBHOOK_URL` to enable Pro trial submissions. Set
+   `MCP_LOG_API_URL` and `MCP_LOG_API_SECRET` together to enable attribution logging.
+   Source defaults are empty. Rotate any receiver credential that was previously published
+   in this repository if it is still accepted by its receiver.
+6. **Privacy page and DPA** before public signups (plan section 5).
+
+### Pro account provisioning
+
+Pro entitlement is a server-managed flag, `hub_accounts.is_pro`, defaulting to `FALSE`.
+There is no public API to change it. After confirming the customer's Pro entitlement, an
+operator can call `AccountStore.setProEnabled(accountId, true)` from a trusted server-side
+provisioning workflow or update the account row directly:
+
+```sql
+UPDATE hub_accounts SET is_pro = TRUE WHERE id = '<account UUID>';
+```
+
+To downgrade, set `is_pro = FALSE`. Existing MCP sessions read the current flag on every
+tool call. The original default cluster remains selected; extra Pro clusters are rejected
+on their next poll, and an OSS tool call never falls back to them. Pro's redaction option
+requires the separate proprietary JobRunr runtime; this OSS connector sends parameters as stored.
 
 `fly.toml` and `.github/workflows/deploy.yml` are left over from the Fly.io days and are not used.
 
@@ -192,9 +220,9 @@ curl -X POST https://mcp.jobrunr.io/mcp \
         "clientInfo":{"name":"curl","version":"1.0"}}}'
 ```
 
-The response carries an `Mcp-Session-Id` header; send it back on every subsequent POST (`tools/list`,
-`tools/call`, …). Note the `Accept` header must list both types — the spec requires it and the server
-returns `400` without it.
+The public docs response has no `Mcp-Session-Id`; send later docs calls directly to the same URL.
+Authenticated operations responses carry `Mcp-Session-Id`; send that header on later operations
+calls. The `Accept` header must list both types or the server returns `400`.
 
 ## Local development
 
@@ -241,18 +269,24 @@ Tests use the bundled `src/test/resources/sample-docs.json` so they don't depend
    Streamable HTTP /mcp   ──►  Claude Code / Cursor / ...
 ```
 
-The server **never generates answers** — it surfaces relevant pages and lets the client LLM synthesize. Stateless apart from the in-memory indexes.
+The public docs server surfaces relevant pages and lets the client LLM synthesize answers.
+Its MCP transport is stateless; the authenticated operations server keeps bounded sessions.
 
 ## Operations
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /mcp` | **MCP Streamable HTTP endpoint** — every JSON-RPC message. What clients should use. |
-| `GET /mcp` | Standalone SSE stream for server-initiated messages (same session) |
+| `POST /mcp` | MCP Streamable HTTP endpoint: stateless public docs or stateful operations with a valid agent token. |
+| `GET /mcp` | Public docs return 405; authenticated operations can open a session stream. |
 | `GET /actuator/health` | Liveness + readiness |
 | `POST /admin/reindex` | Force reload of `docs.json` (HMAC headers required) |
 
-Idle Streamable HTTP streams are kept alive by protocol-level `ping` messages every 25 s.
+Authenticated operations streams are kept alive by protocol-level `ping` messages every 25 s.
+Connector result bodies are read only after token authentication and are capped at 4 MiB. The hub
+rejects malformed connector tokens without a database lookup and permits at most 128 concurrent
+connector token lookups. Monitor repeated 401s: a valid-looking random token still requires one
+bounded lookup. Source-IP blocking is deliberately avoided because a reverse proxy or NAT may
+make unrelated customers share one socket address.
 
 `/admin/reindex` requires two headers:
 
@@ -262,6 +296,8 @@ X-Reindex-Signature: <hex hmac-sha256 of the timestamp, keyed with MCP_REINDEX_S
 ```
 
 The JobRunr website's GitHub Actions deploy step builds these automatically (see `.github/workflows/hugo.yml` in that repo).
+Each valid signature is accepted once inside the five-minute timestamp window; an exact replay
+returns 409. Concurrent reindexes return 429.
 
 ## Configuration
 
@@ -271,21 +307,25 @@ The JobRunr website's GitHub Actions deploy step builds these automatically (see
 | `DOCS_URL` | website `docs.json` | Where to fetch the catalog (HTTP or `file://`) |
 | `DOCS_MANIFEST_URL` | website `manifest.json` | Where to fetch the manifest (used to detect changes) |
 | `DOCS_POLL_INTERVAL` | `PT15M` | ISO-8601 duration for the scheduled poll |
+| `EMBEDDING_TOKENIZER_URI` | Spring AI tokenizer URL | Optional local `file:` URI for the tokenizer; useful for offline tests. |
+| `EMBEDDING_MODEL_URI` | Spring AI ONNX model URL | Optional local `file:` URI for the model; useful for offline tests. |
 | `MCP_REINDEX_SECRET` | _(empty)_ | HMAC secret for `/admin/reindex`. If empty, the endpoint returns 503. |
 | `TRIAL_WEBHOOK_URL` | _(empty)_ | Required to submit trials; no receiver is embedded in source. |
 | `TRIAL_TIMEOUT` | `PT10S` | Webhook call timeout. |
 | `MCP_LOG_API_URL` | _(empty)_ | Optional attribution log receiver. Set with `MCP_LOG_API_SECRET` to enable logging. |
 | `MCP_LOG_API_SECRET` | _(empty)_ | Secret for the attribution log receiver; never store a live value in source. |
-| `MCP_MAX_SESSIONS` | `2000` | Maximum MCP sessions for each of the public and ops transports. |
-| `MCP_SESSION_IDLE_TIMEOUT` | `PT1H` | Idle MCP session eviction; must exceed the 25 s keep-alive interval. |
+| `MCP_MAX_SESSIONS` | `2000` | Maximum authenticated operations MCP sessions; public docs use no sessions. |
+| `MCP_MAX_SESSIONS_PER_ACCOUNT` | `20` | Maximum concurrent operations MCP sessions for one account. |
+| `MCP_SESSION_IDLE_TIMEOUT` | `PT30M` | Authenticated operations session idle expiry. |
 | `RATELIMIT_ENABLED` | `false` | Per-IP rate limiting. See the caveat below before enabling. |
 | `HUB_PUBLIC_URL` | `https://mcp.jobrunr.io` | Base url in sign-in emails and setup snippets |
 | `HUB_DB_URL` | `jdbc:h2:file:./data/hub/hub` | Hub database (H2 file or PostgreSQL) |
-| `HUB_MAIL_FROM` | `JobRunr MCP <mcp@jobrunr.io>` | Sender of sign-in emails |
-| `SPRING_MAIL_HOST` (+ `_PORT`, `_USERNAME`, `_PASSWORD`) | _(unset)_ | SMTP for sign-in emails; unset logs the link instead |
+| `HUB_MAIL_FROM` | `JobRunr <noreply@jobrunr.io>` | Sender of sign-in emails |
+| `SPRING_MAIL_HOST` (+ `_PORT`, `_USERNAME`, `_PASSWORD`) | _(unset)_ | SMTP for sign-in emails; unset makes signup/sign-in return 503 |
 | `HUB_LEADS_WEBHOOK_URL` | _(empty)_ | n8n webhook for signups, first connections and Pro-feature attempts |
 | `HUB_POLL_HOLD` | `PT25S` | How long a connector long-poll is held open |
 | `HUB_REQUEST_TIMEOUT` | `PT20S` | How long an agent waits for the connected instance |
+| `HUB_MAX_NODES_GLOBAL` | `10000` | Service-wide connector safety ceiling; Pro has no per-account node limit. |
 
 > **Rate limiting caveat.** Under Streamable HTTP every tool call is its own POST. The existing
 > 10 requests/minute default can be too aggressive for incident work; retune `RATELIMIT_RPM`
@@ -331,9 +371,8 @@ These are deliberate shortcuts taken to get the server live for testing. Track t
 10. **Marketing surface (separate sprint).** Per the original plan: `/en/mcp/` install page on jobrunr.io with copy-paste
     configs for every IDE, sidebar CTAs on every documentation page, launch blog post. Deferred until the server has been
     validated in production for a couple of weeks.
-11. **Rate-limit trial submissions if abuse appears.** Currently every `request_jobrunr_pro_trial` call hits n8n; dedupe
-    lives on the n8n side. If a misbehaving agent loop spams submissions, add a small in-memory `email → lastSubmittedAt`
-    map with a 1-hour cooldown in `TrialTools`, or move rate limiting to Cloudflare once `mcp.jobrunr.io` DNS is wired.
+11. ~~**Rate-limit trial submissions if abuse appears.**~~ Done — `TrialTools` now deduplicates
+    submissions per email with bounded in-memory state.
 
 ## Deploying to a different environment
 

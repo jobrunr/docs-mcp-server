@@ -34,8 +34,8 @@ class SchemaMigrationTest {
                       scope VARCHAR(16), token_hash VARCHAR(64) NOT NULL UNIQUE, hint VARCHAR(8) NOT NULL,
                       created_at TIMESTAMP NOT NULL, revoked_at TIMESTAMP
                     )""");
-            statement.execute("INSERT INTO hub_accounts (id,email,name,company,created_at) VALUES " +
-                    "('legacy-account','person@example.invalid','Person','Example',TIMESTAMP '2026-01-01 00:00:00')");
+            statement.execute("INSERT INTO hub_accounts (id,email,name,company,cluster_id,created_at) VALUES " +
+                    "('legacy-account','person@example.invalid','Person','Example','legacy-cluster',TIMESTAMP '2026-01-01 00:00:00')");
             statement.execute("INSERT INTO hub_tokens (id,account_id,kind,scope,token_hash,hint,created_at) VALUES " +
                     "('old-agent','legacy-account','agent',NULL,'" + Tokens.hash(oldAgentToken) + "','aaaa',TIMESTAMP '2026-01-01 00:00:00')");
             statement.execute("INSERT INTO hub_tokens (id,account_id,kind,scope,token_hash,hint,created_at) VALUES " +
@@ -44,6 +44,10 @@ class SchemaMigrationTest {
                     "('connector','legacy-account','connector','read','" + Tokens.hash(connectorToken) + "','cccc',TIMESTAMP '2026-01-02 00:00:00')");
 
             runCurrentSchema(connection);
+            statement.execute("""
+                    INSERT INTO hub_instances (account_id, cluster_id, jobrunr_version, snapshot_at)
+                    VALUES ('legacy-account', 'legacy-cluster', '8.0.0', TIMESTAMP '2026-01-02 00:00:00')
+                    """);
             runCurrentSchema(connection); // startup SQL must remain safe on a second deployment
 
             try (var account = statement.executeQuery("SELECT is_pro FROM hub_accounts WHERE id = 'legacy-account'")) {
@@ -65,6 +69,8 @@ class SchemaMigrationTest {
             assertThat(store.findActiveToken(oldAgentToken, AccountStore.KIND_AGENT)).isEmpty();
             store.setProEnabled("legacy-account", true);
             assertThat(store.findById("legacy-account").orElseThrow().proEnabled()).isTrue();
+            assertThat(store.findInstances("legacy-account")).hasSize(1);
+            assertThat(store.findInstance("legacy-account", "legacy-cluster").orElseThrow().jobrunrVersion()).isEqualTo("8.0.0");
         }
     }
 

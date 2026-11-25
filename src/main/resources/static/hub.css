@@ -53,11 +53,12 @@ ol.steps > li { counter-increment: step; position: relative; padding-left: 44px;
 ol.steps > li::before { content: counter(step); position: absolute; left: 0; top: 0; width: 28px; height: 28px; border-radius: 50%; border: 1px solid var(--card-border); color: var(--purple-soft); display: grid; place-items: center; font-weight: 700; font-size: 14px; }
 label { display: block; font-weight: 600; font-size: 14px; margin: 16px 0 6px; }
 label .opt { color: var(--text-muted); font-weight: 400; }
-input[type=text], input[type=email], textarea {
+input[type=text], input[type=email], textarea, select {
   width: 100%; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--field-border);
   background: var(--field); color: var(--text); font: inherit; outline: none; transition: border-color .15s, box-shadow .15s;
 }
-input:focus, textarea:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(46,230,166,.18); }
+input:focus, textarea:focus, select:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(46,230,166,.18); }
+#cluster-select { max-width: 380px; }
 textarea { min-height: 84px; resize: vertical; }
 .btn {
   position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 8px;

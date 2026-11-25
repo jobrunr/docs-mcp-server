@@ -1,6 +1,6 @@
 (() => {
   const $ = (id) => document.getElementById(id);
-  const state = { connector: null, agent: null, publicUrl: location.origin };
+  const state = { connector: null, agent: null, publicUrl: location.origin, selectedClusterId: null, account: null };
 
   function when(iso) {
     if (!iso) return "";
@@ -37,19 +37,44 @@ new JobRunrMcpConnector("${connector}"` + (state.publicUrl !== "https://mcp.jobr
   }
 
   function render(account) {
+    state.account = account;
     state.publicUrl = account.publicUrl || location.origin;
     $("who").textContent = account.email;
     $("subtitle").textContent = account.name + " · " + account.company;
+    $("plan-note").textContent = account.proEnabled
+      ? "JobRunr Pro: unlimited connected nodes and clusters. Use list_clusters in your MCP client and pass cluster_id to select a cluster."
+      : "Free plan: one connected cluster with up to two live nodes. JobRunr Pro allows unlimited connected nodes and clusters.";
+
+    const snapshots = (account.instances && account.instances.length > 0)
+      ? account.instances : (account.instance ? [account.instance] : []);
+    const defaultId = account.instance && account.instance.clusterId;
+    const knownIds = snapshots.map((item) => item.clusterId);
+    state.selectedClusterId = account.proEnabled && knownIds.includes(state.selectedClusterId)
+      ? state.selectedClusterId
+      : (knownIds.includes(defaultId) ? defaultId : knownIds[0] || null);
+    const picker = $("cluster-select");
+    picker.replaceChildren();
+    snapshots.forEach((snapshot) => {
+      const option = document.createElement("option");
+      option.value = snapshot.clusterId;
+      option.textContent = snapshot.clusterId + (snapshot.clusterId === defaultId ? " (default)" : "");
+      picker.append(option);
+    });
+    if (state.selectedClusterId) picker.value = state.selectedClusterId;
+    $("cluster-picker-label").classList.toggle("hidden", !account.proEnabled || snapshots.length < 2);
 
     const nodes = account.nodes || [];
-    const instance = account.instance;
-    $("status-dot").classList.toggle("on", nodes.length > 0);
-    if (nodes.length > 0) {
-      const n = nodes[0];
-      $("status-text").textContent = "Connected" + (nodes.length > 1 ? ` (${nodes.length} instances)` : "");
-      $("status-detail").textContent = `JobRunr ${n.jobrunrVersion || "?"} on ${n.framework || "?"}, Java ${n.javaVersion || "?"}. Job parameter values are ${n.redaction ? "redacted" : "sent as-is"}. Last seen ${when(n.lastSeenAt)}.`;
+    const selectedNodes = account.proEnabled && state.selectedClusterId
+      ? nodes.filter((node) => node.clusterId === state.selectedClusterId) : nodes;
+    const instance = snapshots.find((snapshot) => snapshot.clusterId === state.selectedClusterId) || account.instance;
+    $("status-dot").classList.toggle("on", selectedNodes.length > 0);
+    if (selectedNodes.length > 0) {
+      const n = selectedNodes[0];
+      $("status-text").textContent = "Connected" + (selectedNodes.length > 1 ? ` (${selectedNodes.length} instances)` : "");
+      $("status-detail").textContent = `JobRunr ${n.jobrunrVersion || "?"} on ${n.framework || "?"}, Java ${n.javaVersion || "?"}. ${n.redaction ? "Connector reports parameter redaction enabled" : "Job parameter values are sent as-is"}. Last seen ${when(n.lastSeenAt)}.`;
     } else {
-      $("status-text").textContent = instance ? "Not connected right now" : "Waiting for your application";
+      $("status-text").textContent = account.proEnabled && nodes.length > 0
+        ? "Selected cluster not connected right now" : (instance ? "Not connected right now" : "Waiting for your application");
       $("status-detail").textContent = instance
         ? `Last snapshot ${when(instance.snapshotAt)}. Start your application with the connector token to reconnect.`
         : "Add the connector token to your application and start it. This page updates by itself.";
@@ -65,7 +90,7 @@ new JobRunrMcpConnector("${connector}"` + (state.publicUrl !== "https://mcp.jobr
         stat(instance.jobsSucceeded, "succeeded"),
         stat(instance.servers, "servers"),
         stat(instance.recurringJobs, "recurring jobs"));
-      $("stats-age").textContent = "Numbers updated " + when(instance.snapshotAt) + (nodes.length > 0 ? ", refreshed while this page is open." : ".");
+      $("stats-age").textContent = "Numbers updated " + when(instance.snapshotAt) + (selectedNodes.length > 0 ? ", refreshed while this page is open." : ".");
     }
     $("stats-age").classList.toggle("hidden", !instance);
 
@@ -97,6 +122,11 @@ new JobRunrMcpConnector("${connector}"` + (state.publicUrl !== "https://mcp.jobr
     });
     renderSnippets();
   }
+
+  $("cluster-select").addEventListener("change", (event) => {
+    state.selectedClusterId = event.target.value;
+    if (state.account) render(state.account);
+  });
 
   async function load() {
     const response = await fetch("/api/account", { headers: { Accept: "application/json" } });

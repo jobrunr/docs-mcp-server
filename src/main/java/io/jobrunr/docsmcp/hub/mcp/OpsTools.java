@@ -19,6 +19,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
@@ -34,6 +35,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -52,16 +54,19 @@ public class OpsTools {
     public static final String USER_AGENT_KEY = "jobrunr.userAgent";
 
     static final int MAX_BULK_REQUEUE = 100;
+    private static final int MAX_LIST_OFFSET = 10_000;
+    private static final int MAX_PREVIEWS_PER_ACCOUNT = 20;
+    private static final int MAX_PREVIEWS_GLOBAL = 2_000;
     private static final int MAX_STRING_LENGTH = 6_000;
     private static final int MAX_HISTORY = 10;
     private static final Duration PREVIEW_TTL = Duration.ofMinutes(15);
-    private static final Duration PRO_LEAD_COOLDOWN = Duration.ofHours(24);
     private static final List<String> STATES = List.of("AWAITING", "SCHEDULED", "ENQUEUED", "PROCESSING", "FAILED", "SUCCEEDED", "DELETED");
     private static final List<String> OVERVIEW_STATES = List.of("SCHEDULED", "ENQUEUED", "PROCESSING", "FAILED", "SUCCEEDED");
     private static final Set<String> REQUEUEABLE_STATES = Set.of("FAILED", "SUCCEEDED", "DELETED", "SCHEDULED");
     private static final Pattern JOB_ID = Pattern.compile("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
     private static final Pattern RECURRING_JOB_ID = Pattern.compile("[\\dA-Za-z\\-_(),.]{1,127}");
     private static final Pattern PROBLEM_TYPE = Pattern.compile("[a-z0-9-]{1,64}");
+    private static final Pattern CLUSTER_ID = Pattern.compile("[A-Za-z0-9_-]{1,64}");
     private static final Pattern VOLATILE_PARTS = Pattern.compile("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|\\d+");
     private static final String PRO_URL = "https://www.jobrunr.io/en/pro/";
 
@@ -76,7 +81,6 @@ public class OpsTools {
     private final ObjectMapper objectMapper;
     private final McpJsonMapper mcpJsonMapper;
     private final Map<String, RequeuePreview> previews = new ConcurrentHashMap<>();
-    private final Map<String, Instant> lastProLead = new ConcurrentHashMap<>();
 
     public OpsTools(DashboardClient dashboard, ConnectorHub hub, AccountStore store, LeadEvents leadEvents, QueryLogClient queryLogClient,
                     ObjectMapper objectMapper, @Qualifier("mcpServerJsonMapper") JsonMapper mcpServerJsonMapper,
@@ -103,7 +107,8 @@ public class OpsTools {
         }
     }
 
-    private record RequeuePreview(String accountId, Set<String> requestedIds, List<String> requeueableIds, Instant createdAt) {
+    private record RequeuePreview(String accountId, String clusterId, Set<String> requestedIds,
+                                  List<String> requeueableIds, Instant createdAt) {
     }
 
     public List<SyncToolSpecification> specifications() {
@@ -118,7 +123,7 @@ public class OpsTools {
                         """
                                 {"type":"object","properties":{
                                   "state":{"type":"string","enum":["AWAITING","SCHEDULED","ENQUEUED","PROCESSING","FAILED","SUCCEEDED","DELETED"],"description":"Job state to list"},
-                                  "offset":{"type":"integer","minimum":0,"description":"Number of jobs to skip (default 0)"},
+                                  "offset":{"type":"integer","minimum":0,"maximum":10000,"description":"Number of jobs to skip (default 0, max 10000)"},
                                   "limit":{"type":"integer","minimum":1,"maximum":100,"description":"Number of jobs to return (default 20, max 100)"}},
                                  "required":["state"]}""",
                         readOnly(), this::listJobs),
@@ -139,7 +144,7 @@ public class OpsTools {
                                 Recurring jobs with their id, name, cron or interval schedule, time zone and next run.""",
                         """
                                 {"type":"object","properties":{
-                                  "offset":{"type":"integer","minimum":0,"description":"Number of recurring jobs to skip (default 0)"},
+                                  "offset":{"type":"integer","minimum":0,"maximum":10000,"description":"Number of recurring jobs to skip (default 0, max 10000)"},
                                   "limit":{"type":"integer","minimum":1,"maximum":200,"description":"Number to return (default 50)"}}}""",
                         readOnly(), this::listRecurringJobs),
                 tool("list_servers", "List background job servers", """
@@ -167,7 +172,7 @@ public class OpsTools {
                                 token with operate access.""",
                         """
                                 {"type":"object","properties":{"job_id":{"type":"string","description":"The job id (a UUID)"}},"required":["job_id"]}""",
-                        annotations(false, false, true), (account, args) -> requeueJob(account, jobId(args, "job_id"))),
+                        annotations(false, true, false), (account, args) -> requeueJob(account, jobId(args, "job_id"))),
                 tool("requeue_jobs", "Requeue jobs in bulk", """
                                 Requeue up to %d jobs in two steps. First call with dry_run=true (the default): it checks every \
                                 job and returns a preview_id. Show the preview to the user. Then call again with dry_run=false, \
@@ -178,7 +183,7 @@ public class OpsTools {
                                   "dry_run":{"type":"boolean","description":"true (default) returns a preview, false executes a previous preview"},
                                   "preview_id":{"type":"string","description":"The preview_id returned by the dry run, required when dry_run is false"}},
                                  "required":["job_ids"]}""".formatted(MAX_BULK_REQUEUE),
-                        annotations(false, false, false), this::requeueJobs),
+                        annotations(false, true, false), this::requeueJobs),
                 tool("delete_job", "Delete job", """
                                 Delete one job (it moves to the DELETED state and is removed later). Needs a connector token with \
                                 operate access. Only call this when the user explicitly asked to delete this job.""",
@@ -189,19 +194,22 @@ public class OpsTools {
                                 Run a recurring job now, outside its schedule. Needs a connector token with operate access.""",
                         """
                                 {"type":"object","properties":{"recurring_job_id":{"type":"string","description":"The recurring job id from list_recurring_jobs"}},"required":["recurring_job_id"]}""",
-                        annotations(false, false, false), this::triggerRecurringJob),
+                        annotations(false, true, false), this::triggerRecurringJob),
                 tool("dismiss_problem", "Dismiss problem", """
                                 Dismiss a problem shown in the dashboard, by its type from get_problems. Needs a connector token \
                                 with operate access.""",
                         """
                                 {"type":"object","properties":{"problem_type":{"type":"string","description":"The problem type, for example severe-jobrunr-exception"}},"required":["problem_type"]}""",
-                        annotations(false, false, true), this::dismissProblem));
+                        annotations(false, true, true), this::dismissProblem));
     }
 
     // ------------------------------------------------------------------ read tools
 
     private Object clusterOverview(Account account) {
-        List<ConnectorHub.Node> nodes = hub.onlineNodes(account.id());
+        List<ConnectorHub.Node> nodes = hub.onlineNodes(account.id()).stream()
+                .filter(ConnectorHub.Node::isReady)
+                .filter(node -> account.clusterId() == null || account.clusterId().equals(node.clusterId()))
+                .toList();
         if (nodes.isEmpty()) throw new ConnectorHub.NoInstanceConnectedException();
 
         List<String> paths = new ArrayList<>(List.of("/api/version", "/api/servers", "/api/problems", "/api/recurring-jobs?offset=0&limit=1"));
@@ -216,6 +224,7 @@ public class OpsTools {
         if (results.get(1) != null) results.get(1).forEach(server -> servers.add(compactServer(server)));
 
         Map<String, Object> overview = new LinkedHashMap<>();
+        overview.put("clusterId", account.clusterId());
         overview.put("jobrunrVersion", text(results.get(0), "version"));
         overview.put("connectedNodes", nodes.size());
         overview.put("jobParameterValues", nodes.getFirst().info().redaction() ? "redacted" : "included");
@@ -236,7 +245,7 @@ public class OpsTools {
     private Object listJobs(Account account, Map<String, Object> args) {
         String state = string(args, "state");
         if (state == null || !STATES.contains(state.toUpperCase())) throw new ToolException("state must be one of " + STATES);
-        int offset = integer(args, "offset", 0, 0, Integer.MAX_VALUE);
+        int offset = integer(args, "offset", 0, 0, MAX_LIST_OFFSET);
         int limit = integer(args, "limit", 20, 1, 100);
         JsonNode page = dashboard.get(account, "/api/jobs?state=" + state.toUpperCase() + "&offset=" + offset + "&limit=" + limit + "&order=updatedAt:DESC");
 
@@ -323,7 +332,7 @@ public class OpsTools {
     }
 
     private Object listRecurringJobs(Account account, Map<String, Object> args) {
-        int offset = integer(args, "offset", 0, 0, Integer.MAX_VALUE);
+        int offset = integer(args, "offset", 0, 0, MAX_LIST_OFFSET);
         int limit = integer(args, "limit", 50, 1, 200);
         JsonNode page = dashboard.get(account, "/api/recurring-jobs?offset=" + offset + "&limit=" + limit);
         List<Object> recurringJobs = new ArrayList<>();
@@ -352,16 +361,29 @@ public class OpsTools {
     }
 
     private Object listClusters(Account account) {
-        List<ConnectorHub.Node> nodes = hub.onlineNodes(account.id());
-        Map<String, Object> cluster = new LinkedHashMap<>();
-        cluster.put("clusterId", account.clusterId());
-        cluster.put("connected", !nodes.isEmpty());
-        cluster.put("connectedNodes", nodes.size());
-        cluster.put("jobrunrVersion", nodes.isEmpty() ? null : nodes.getFirst().info().jobrunrVersion());
+        List<ConnectorHub.Node> nodes = hub.onlineNodes(account.id()).stream()
+                .filter(ConnectorHub.Node::isReady)
+                .filter(node -> account.proEnabled() || account.clusterId() == null || account.clusterId().equals(node.clusterId()))
+                .toList();
+        Map<String, List<ConnectorHub.Node>> byCluster = new LinkedHashMap<>();
+        if (account.clusterId() != null) byCluster.put(account.clusterId(), new ArrayList<>());
+        nodes.forEach(node -> byCluster.computeIfAbsent(node.clusterId(), ignored -> new ArrayList<>()).add(node));
+        List<Map<String, Object>> clusters = new ArrayList<>();
+        byCluster.forEach((id, members) -> {
+            Map<String, Object> cluster = new LinkedHashMap<>();
+            cluster.put("clusterId", id);
+            cluster.put("connected", !members.isEmpty());
+            cluster.put("connectedNodes", members.size());
+            cluster.put("default", Objects.equals(id, account.clusterId()));
+            cluster.put("jobrunrVersion", members.isEmpty() ? null : members.getFirst().info().jobrunrVersion());
+            clusters.add(cluster);
+        });
         Map<String, Object> result = new LinkedHashMap<>();
-        result.put("clusters", List.of(cluster));
-        result.put("note", "The free JobRunr MCP connects one cluster per account. Operating several clusters from one agent, "
-                + "with a cluster argument on every tool, is part of JobRunr Pro (" + PRO_URL + ").");
+        result.put("clusters", clusters);
+        result.put("proEnabled", account.proEnabled());
+        result.put("note", account.proEnabled()
+                ? "JobRunr Pro allows unlimited connected nodes and clusters. Pass cluster_id on a cluster tool to select an online cluster."
+                : "The free JobRunr MCP allows one cluster with up to two live nodes. JobRunr Pro allows unlimited connected nodes and clusters (" + PRO_URL + ").");
         return result;
     }
 
@@ -375,6 +397,7 @@ public class OpsTools {
     private Object requeueJobs(Account account, Map<String, Object> args) {
         Object rawIds = args.get("job_ids");
         if (!(rawIds instanceof Collection<?> collection) || collection.isEmpty()) throw new ToolException("job_ids must be a non-empty array of job ids");
+        if (collection.size() > MAX_BULK_REQUEUE) throw new ToolException("At most " + MAX_BULK_REQUEUE + " jobs per call.");
         Set<String> jobIds = new LinkedHashSet<>();
         for (Object id : collection) {
             if (!(id instanceof String s) || !JOB_ID.matcher(s).matches()) throw new ToolException("Not a job id: " + id);
@@ -402,16 +425,22 @@ public class OpsTools {
                 String state = currentState(job);
                 entry.put("jobName", text(job, "jobName"));
                 entry.put("state", state);
-                boolean willRequeue = REQUEUEABLE_STATES.contains(state);
+                boolean willRequeue = state != null && REQUEUEABLE_STATES.contains(state);
                 entry.put("willRequeue", willRequeue);
                 if (!willRequeue) entry.put("reason", "a job in state " + state + " is not requeued");
                 if (willRequeue) requeueable.add(ids.get(i));
             }
             preview.add(entry);
         }
-        previews.values().removeIf(p -> p.createdAt.isBefore(Instant.now().minus(PREVIEW_TTL)));
         String previewId = UUID.randomUUID().toString();
-        previews.put(previewId, new RequeuePreview(account.id(), jobIds, requeueable, Instant.now()));
+        synchronized (previews) {
+            expirePreviews();
+            if (previews.size() >= MAX_PREVIEWS_GLOBAL ||
+                    previews.values().stream().filter(p -> p.accountId.equals(account.id())).count() >= MAX_PREVIEWS_PER_ACCOUNT) {
+                throw new ToolException("Too many active requeue previews. Finish or wait for an earlier preview to expire.");
+            }
+            previews.put(previewId, new RequeuePreview(account.id(), account.clusterId(), jobIds, requeueable, Instant.now()));
+        }
 
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("dryRun", true);
@@ -431,19 +460,37 @@ public class OpsTools {
         if (preview == null || !preview.accountId.equals(account.id()) || preview.createdAt.isBefore(Instant.now().minus(PREVIEW_TTL))) {
             throw new ToolException("Run requeue_jobs with dry_run=true first and pass the preview_id it returns.");
         }
+        if (!Objects.equals(preview.clusterId, account.clusterId())) {
+            throw new ToolException("cluster_id differs from the preview. Run a new dry run for this cluster.");
+        }
         if (!preview.requestedIds.equals(jobIds)) {
             throw new ToolException("job_ids differ from the preview. Run a new dry run for this set of jobs.");
         }
-        previews.remove(previewId);
-
-        List<String> errors = dashboard.executeAll(account, "POST", preview.requeueableIds.stream().map(id -> "/api/jobs/" + id + "/requeue").toList());
-        List<String> requeued = new ArrayList<>();
-        List<Object> failed = new ArrayList<>();
-        for (int i = 0; i < errors.size(); i++) {
-            if (errors.get(i) == null) requeued.add(preview.requeueableIds.get(i));
-            else failed.add(Map.of("id", preview.requeueableIds.get(i), "error", errors.get(i)));
+        if (!previews.remove(previewId, preview)) {
+            throw new ToolException("This requeue preview was already used. Run a new dry run.");
         }
-        if (requeued.isEmpty() && !failed.isEmpty()) {
+
+        // A job may have changed state since the preview. Re-read it before sending an operation.
+        List<String> previewed = preview.requeueableIds;
+        List<JsonNode> currentJobs = dashboard.getAll(account, previewed.stream().map(id -> "/api/jobs/" + id).toList());
+        List<String> currentIds = new ArrayList<>();
+        List<Object> failed = new ArrayList<>();
+        for (int i = 0; i < previewed.size(); i++) {
+            JsonNode current = currentJobs.get(i);
+            String state = current == null ? null : currentState(current);
+            if (current == null) failed.add(Map.of("id", previewed.get(i), "error", "job disappeared after preview"));
+            else if (state == null || !REQUEUEABLE_STATES.contains(state)) {
+                failed.add(Map.of("id", previewed.get(i), "error", "job state changed after preview"));
+            } else currentIds.add(previewed.get(i));
+        }
+        List<String> errors = currentIds.isEmpty() ? List.of() : dashboard.executeAll(account, "POST",
+                currentIds.stream().map(id -> "/api/jobs/" + id + "/requeue").toList());
+        List<String> requeued = new ArrayList<>();
+        for (int i = 0; i < errors.size(); i++) {
+            if (errors.get(i) == null) requeued.add(currentIds.get(i));
+            else failed.add(Map.of("id", currentIds.get(i), "error", errors.get(i)));
+        }
+        if (requeued.isEmpty() && !errors.isEmpty() && !failed.isEmpty()) {
             throw new ToolException(readOnlyHint(errors.getFirst()));
         }
         Map<String, Object> result = new LinkedHashMap<>();
@@ -473,12 +520,8 @@ public class OpsTools {
     }
 
     private Object proFeature(Account account, String toolName, String feature, String message) {
-        Instant last = lastProLead.get(account.id());
-        if (last == null || last.isBefore(Instant.now().minus(PRO_LEAD_COOLDOWN))) {
-            lastProLead.put(account.id(), Instant.now());
-            RequestContextHolder.RequestContext rc = RequestContextHolder.peek();
-            leadEvents.record(account, LeadEvents.PRO_FEATURE_ATTEMPT, toolName, rc != null ? rc.clientIp() : null);
-        }
+        RequestContextHolder.RequestContext rc = RequestContextHolder.peek();
+        leadEvents.record(account, LeadEvents.PRO_FEATURE_ATTEMPT, toolName, rc != null ? rc.clientIp() : null);
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("proFeature", true);
         result.put("feature", feature);
@@ -489,10 +532,27 @@ public class OpsTools {
         return result;
     }
 
+    @Scheduled(fixedDelay = 60_000)
+    public void expirePreviews() {
+        previews.values().removeIf(p -> p.createdAt.isBefore(Instant.now().minus(PREVIEW_TTL)));
+    }
+
     // ------------------------------------------------------------------ plumbing
 
     private SyncToolSpecification tool(String name, String title, String description, String inputSchema,
                                        ToolAnnotations annotations, ToolHandler handler) {
+        if (!"list_clusters".equals(name) && !"search_jobs".equals(name)) {
+            ObjectNode schema = (ObjectNode) objectMapper.readTree(inputSchema);
+            ObjectNode properties = (ObjectNode) schema.get("properties");
+            ObjectNode selector = objectMapper.createObjectNode();
+            selector.put("type", "string");
+            selector.put("minLength", 1);
+            selector.put("maxLength", 64);
+            selector.put("description", "JobRunr Pro: an online cluster_id from list_clusters. Omit to use the account's default cluster.");
+            properties.set("cluster_id", selector);
+            inputSchema = objectMapper.writeValueAsString(schema);
+            description += "\nOn a JobRunr Pro account, pass cluster_id from list_clusters to target another connected cluster.";
+        }
         McpSchema.Tool tool = McpSchema.Tool.builder()
                 .name(name)
                 .title(title)
@@ -505,31 +565,55 @@ public class OpsTools {
 
     private CallToolResult call(String name, ToolHandler handler, McpSyncServerExchange exchange, McpSchema.CallToolRequest request) {
         Object account = exchange.transportContext().get(ACCOUNT_KEY);
-        if (!(account instanceof Account a)) return error("Not authenticated. Add your JobRunr MCP agent token as a Bearer token.");
+        if (!(account instanceof Account authenticated)) return error("Not authenticated. Add your JobRunr MCP agent token as a Bearer token.");
+        // Entitlement and default-cluster changes must take effect even in a long-lived MCP session.
+        Account a = store.findById(authenticated.id()).orElse(null);
+        if (a == null) return error("This JobRunr MCP account no longer exists.");
 
         long start = System.nanoTime();
         Map<String, Object> arguments = request.arguments() == null ? Map.of() : request.arguments();
         Object result = null;
         CallToolResult answer = null;
         try {
-            result = handler.handle(a, arguments);
+            result = handler.handle(selectCluster(a, name, arguments), arguments);
             return answer = CallToolResult.builder().addTextContent(objectMapper.writeValueAsString(result)).isError(false).build();
         } catch (ToolException e) {
             return answer = error(e.getMessage());
         } catch (ConnectorHub.NoInstanceConnectedException e) {
             return answer = error(e.getMessage() + " Start the application with the JobRunr dashboard enabled and the connector token set "
                     + "(jobrunr.dashboard.mcp.token), see https://mcp.jobrunr.io/account.");
+        } catch (ConnectorHub.ClusterNotConnectedException | ConnectorHub.ReadOnlyConnectorException |
+                 ConnectorHub.TooManyPendingRequestsException e) {
+            return answer = error(e.getMessage());
         } catch (DashboardClient.DashboardException e) {
             return answer = error(e.status() == 404 ? "Not found: " + e.getMessage() : readOnlyHint(e.getMessage()));
         } catch (RuntimeException e) {
             if (e.getCause() instanceof ConnectorHub.InstanceTimeoutException timeout) return answer = error(timeout.getMessage());
             log.warn("Tool {} failed", name, e);
-            return answer = error(e instanceof ConnectorHub.InstanceTimeoutException ? e.getMessage() : "The tool failed: " + e.getMessage());
+            return answer = error(e instanceof ConnectorHub.InstanceTimeoutException ? e.getMessage() : "The tool failed. Check the connector and retry.");
         } finally {
             boolean success = answer != null && !Boolean.TRUE.equals(answer.isError());
             String errorMessage = answer == null || success ? null : errorText(answer);
             recordToolCall(a, name, arguments, result, success, errorMessage, (System.nanoTime() - start) / 1_000_000, exchange);
         }
+    }
+
+    private Account selectCluster(Account account, String toolName, Map<String, Object> arguments) {
+        Object requested = arguments.get("cluster_id");
+        if (requested == null) return account;
+        if ("list_clusters".equals(toolName) || "search_jobs".equals(toolName)) {
+            throw new ToolException("cluster_id is not supported by " + toolName);
+        }
+        if (!(requested instanceof String clusterId) || !CLUSTER_ID.matcher(clusterId).matches()) {
+            throw new ToolException("cluster_id must be an id returned by list_clusters.");
+        }
+        if (!account.proEnabled()) {
+            throw new ToolException("Selecting a cluster requires JobRunr Pro. Omit cluster_id for the free cluster.");
+        }
+        boolean member = hub.onlineNodes(account.id()).stream()
+                .anyMatch(node -> node.isReady() && clusterId.equals(node.clusterId()));
+        if (!member) throw new ToolException("Cluster " + clusterId + " is not connected to this account.");
+        return account.withClusterId(clusterId);
     }
 
     private void recordToolCall(Account account, String name, Map<String, Object> arguments, Object result, boolean success,

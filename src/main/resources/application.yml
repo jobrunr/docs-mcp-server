@@ -19,8 +19,9 @@ spring:
       server:
         name: jobrunr-docs
         version: 0.2.0
-        # Current MCP clients use Streamable HTTP at one endpoint.
-        protocol: streamable
+        # Public docs are stateless, so anonymous initializations cannot occupy session slots.
+        # Agent-token requests still use the separately configured, bounded ops transport.
+        protocol: stateless
         streamable-http:
           mcp-endpoint: /mcp
           keep-alive-interval: 25s
@@ -46,6 +47,12 @@ management:
     health:
       probes:
         enabled: true
+
+embedding:
+  # Optional file: URIs keep local test runs offline. Empty values retain the
+  # Spring AI tokenizer/model defaults used by the deployed service.
+  tokenizer-uri: ${EMBEDDING_TOKENIZER_URI:}
+  model-uri: ${EMBEDDING_MODEL_URI:}
 
 docs:
   url: ${DOCS_URL:https://www.jobrunr.io/mcp/docs.json}
@@ -73,12 +80,15 @@ hub:
   magic-link-ttl: PT30M
   session-ttl: P30D
   snapshot-interval: PT10M
+  # A service-wide safety ceiling; Pro has no per-account node or cluster limit.
+  max-nodes-global: ${HUB_MAX_NODES_GLOBAL:10000}
 
 mcp:
   sessions:
-    # Separate caps apply to public docs and authenticated operations transports.
+    # Public docs are stateless; these limits apply only to authenticated operations.
     max: ${MCP_MAX_SESSIONS:2000}
-    idle-timeout: ${MCP_SESSION_IDLE_TIMEOUT:PT1H}
+    max-per-account: ${MCP_MAX_SESSIONS_PER_ACCOUNT:20}
+    idle-timeout: ${MCP_SESSION_IDLE_TIMEOUT:PT30M}
 
 ratelimit:
   enabled: ${RATELIMIT_ENABLED:false}

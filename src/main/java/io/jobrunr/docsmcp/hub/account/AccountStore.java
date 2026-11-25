@@ -59,8 +59,16 @@ public class AccountStore {
                 .update() == 1;
     }
 
-    public void linkCluster(String accountId, String clusterId) {
-        jdbc.sql("UPDATE hub_accounts SET cluster_id = ? WHERE id = ?").params(clusterId, accountId).update();
+    /** Atomically claims the default cluster; concurrent first connections cannot overwrite one another. */
+    public boolean claimClusterIfUnlinked(String accountId, String clusterId) {
+        return jdbc.sql("UPDATE hub_accounts SET cluster_id = ? WHERE id = ? AND cluster_id IS NULL")
+                .params(clusterId, accountId).update() == 1;
+    }
+
+    /** Atomically moves an OSS account after its previously linked cluster went away. */
+    public boolean moveClusterIfCurrent(String accountId, String previousClusterId, String nextClusterId) {
+        return jdbc.sql("UPDATE hub_accounts SET cluster_id = ? WHERE id = ? AND cluster_id = ?")
+                .params(nextClusterId, accountId, previousClusterId).update() == 1;
     }
 
     // ------------------------------------------------------------------ magic links and sessions
@@ -171,20 +179,25 @@ public class AccountStore {
             Instant firstConnectedAt, Instant snapshotAt) {
     }
 
-    /** @return true if this is the first snapshot ever stored for the account */
+    /** @return true if this is the first snapshot stored for this account and cluster */
+    @Transactional
     public boolean saveInstance(InstanceSnapshot s) {
+        if (s.clusterId() == null) throw new IllegalArgumentException("A snapshot needs a cluster id");
+        // Serialize the update-then-insert path for simultaneous nodes of one cluster.
+        jdbc.sql("SELECT id FROM hub_accounts WHERE id = ? FOR UPDATE").param(s.accountId())
+                .query(String.class).optional().orElseThrow();
         int updated = jdbc.sql("""
-                        UPDATE hub_instances SET cluster_id = ?, jobrunr_version = ?, java_version = ?, framework = ?, storage_provider = ?,
+                        UPDATE hub_cluster_snapshots SET jobrunr_version = ?, java_version = ?, framework = ?, storage_provider = ?,
                             redaction = ?, servers = ?, recurring_jobs = ?, jobs_scheduled = ?, jobs_enqueued = ?, jobs_processing = ?,
                             jobs_failed = ?, jobs_succeeded = ?, snapshot_at = ?
-                        WHERE account_id = ?""")
-                .params(s.clusterId(), s.jobrunrVersion(), s.javaVersion(), s.framework(), s.storageProvider(), s.redaction(), s.servers(),
+                        WHERE account_id = ? AND cluster_id = ?""")
+                .params(s.jobrunrVersion(), s.javaVersion(), s.framework(), s.storageProvider(), s.redaction(), s.servers(),
                         s.recurringJobs(), s.jobsScheduled(), s.jobsEnqueued(), s.jobsProcessing(), s.jobsFailed(), s.jobsSucceeded(),
-                        ts(s.snapshotAt()), s.accountId())
+                        ts(s.snapshotAt()), s.accountId(), s.clusterId())
                 .update();
         if (updated == 1) return false;
         jdbc.sql("""
-                        INSERT INTO hub_instances (account_id, cluster_id, jobrunr_version, java_version, framework, storage_provider, redaction,
+                        INSERT INTO hub_cluster_snapshots (account_id, cluster_id, jobrunr_version, java_version, framework, storage_provider, redaction,
                             servers, recurring_jobs, jobs_scheduled, jobs_enqueued, jobs_processing, jobs_failed, jobs_succeeded,
                             first_connected_at, snapshot_at)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""")
@@ -195,15 +208,19 @@ public class AccountStore {
         return true;
     }
 
-    public Optional<InstanceSnapshot> findInstance(String accountId) {
-        return jdbc.sql("SELECT * FROM hub_instances WHERE account_id = ?").param(accountId)
-                .query((rs, i) -> new InstanceSnapshot(
-                        rs.getString("account_id"), rs.getString("cluster_id"), rs.getString("jobrunr_version"), rs.getString("java_version"),
-                        rs.getString("framework"), rs.getString("storage_provider"), (Boolean) rs.getObject("redaction"),
-                        (Integer) rs.getObject("servers"), longOrNull(rs, "recurring_jobs"), longOrNull(rs, "jobs_scheduled"),
-                        longOrNull(rs, "jobs_enqueued"), longOrNull(rs, "jobs_processing"), longOrNull(rs, "jobs_failed"),
-                        longOrNull(rs, "jobs_succeeded"), instant(rs, "first_connected_at"), instant(rs, "snapshot_at")))
-                .optional();
+    public Optional<InstanceSnapshot> findInstance(String accountId, String clusterId) {
+        if (clusterId == null) return Optional.empty();
+        Optional<InstanceSnapshot> current = jdbc.sql("""
+                        SELECT * FROM hub_cluster_snapshots WHERE account_id = ? AND cluster_id = ?""")
+                .params(accountId, clusterId).query(AccountStore::instance).optional();
+        if (current.isPresent()) return current;
+        return jdbc.sql("SELECT * FROM hub_instances WHERE account_id = ? AND cluster_id = ?")
+                .params(accountId, clusterId).query(AccountStore::instance).optional();
+    }
+
+    public List<InstanceSnapshot> findInstances(String accountId) {
+        return jdbc.sql("SELECT * FROM hub_cluster_snapshots WHERE account_id = ? ORDER BY snapshot_at DESC")
+                .param(accountId).query(AccountStore::instance).list();
     }
 
     // ------------------------------------------------------------------ usage and lead events
@@ -241,6 +258,15 @@ public class AccountStore {
         return new Account(rs.getString("id"), rs.getString("email"), rs.getString("name"), rs.getString("company"),
                 rs.getString("job_role"), rs.getString("use_case"), rs.getString("cluster_id"),
                 instant(rs, "created_at"), instant(rs, "verified_at"), rs.getBoolean("is_pro"));
+    }
+
+    private static InstanceSnapshot instance(ResultSet rs, int rowNum) throws SQLException {
+        return new InstanceSnapshot(
+                rs.getString("account_id"), rs.getString("cluster_id"), rs.getString("jobrunr_version"), rs.getString("java_version"),
+                rs.getString("framework"), rs.getString("storage_provider"), (Boolean) rs.getObject("redaction"),
+                (Integer) rs.getObject("servers"), longOrNull(rs, "recurring_jobs"), longOrNull(rs, "jobs_scheduled"),
+                longOrNull(rs, "jobs_enqueued"), longOrNull(rs, "jobs_processing"), longOrNull(rs, "jobs_failed"),
+                longOrNull(rs, "jobs_succeeded"), instant(rs, "first_connected_at"), instant(rs, "snapshot_at"));
     }
 
     private static Timestamp ts(Instant instant) {

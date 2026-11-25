@@ -3,6 +3,8 @@ package io.jobrunr.docsmcp.hub.account;
 import io.jobrunr.docsmcp.hub.HubProperties;
 import io.jobrunr.docsmcp.hub.connector.ConnectorHub;
 import io.jobrunr.docsmcp.hub.connector.InstanceMonitor;
+import io.jobrunr.docsmcp.hub.mcp.OpsMcpServerConfig;
+import io.jobrunr.docsmcp.hub.mcp.OpsSessionQuotaWebFilter;
 import io.jobrunr.docsmcp.hub.leads.LeadEvents;
 import io.jobrunr.docsmcp.web.ClientIpExtractor;
 import org.slf4j.Logger;
@@ -49,16 +51,22 @@ public class AccountController {
     private final LeadEvents leadEvents;
     private final ConnectorHub hub;
     private final InstanceMonitor monitor;
+    private final OpsMcpServerConfig.OpsMcpEndpoint opsEndpoint;
+    private final OpsSessionQuotaWebFilter sessionQuota;
     private final HubProperties properties;
     private final Map<String, Instant> lastLinkPerEmail = boundedMap(MAX_RATE_LIMIT_KEYS);
     private final Map<String, List<Instant>> linksPerIp = boundedMap(MAX_RATE_LIMIT_KEYS);
 
-    public AccountController(AccountStore store, Mailer mailer, LeadEvents leadEvents, ConnectorHub hub, InstanceMonitor monitor, HubProperties properties) {
+    public AccountController(AccountStore store, Mailer mailer, LeadEvents leadEvents, ConnectorHub hub, InstanceMonitor monitor,
+                             OpsMcpServerConfig.OpsMcpEndpoint opsEndpoint, OpsSessionQuotaWebFilter sessionQuota,
+                             HubProperties properties) {
         this.store = store;
         this.mailer = mailer;
         this.leadEvents = leadEvents;
         this.hub = hub;
         this.monitor = monitor;
+        this.opsEndpoint = opsEndpoint;
+        this.sessionQuota = sessionQuota;
         this.properties = properties;
     }
 
@@ -159,8 +167,12 @@ public class AccountController {
             body.put("proEnabled", account.proEnabled());
             body.put("publicUrl", properties.publicUrl());
             body.put("tokens", store.activeTokens(account.id()));
-            body.put("nodes", hub.onlineNodes(account.id()).stream().map(node -> {
+            body.put("nodes", hub.onlineNodes(account.id()).stream()
+                    .filter(ConnectorHub.Node::isReady)
+                    .filter(node -> account.proEnabled() || account.clusterId() == null || account.clusterId().equals(node.clusterId()))
+                    .map(node -> {
                 Map<String, Object> n = new LinkedHashMap<>();
+                n.put("clusterId", node.clusterId());
                 n.put("jobrunrVersion", node.info().jobrunrVersion());
                 n.put("javaVersion", node.info().javaVersion());
                 n.put("framework", node.info().framework());
@@ -169,7 +181,14 @@ public class AccountController {
                 n.put("lastSeenAt", node.lastPollAt());
                 return n;
             }).toList());
-            body.put("instance", store.findInstance(account.id()).orElse(null));
+            List<AccountStore.InstanceSnapshot> instances = store.findInstances(account.id());
+            if (!account.proEnabled()) {
+                instances = instances.stream()
+                        .filter(snapshot -> account.clusterId() != null && account.clusterId().equals(snapshot.clusterId()))
+                        .toList();
+            }
+            body.put("instances", instances);
+            body.put("instance", store.findInstance(account.id(), account.clusterId()).orElse(null));
             monitor.refreshSoon(account.id());
             body.put("recentToolCalls", store.recentToolCalls(account.id(), 15));
             return ResponseEntity.ok(body);
@@ -181,6 +200,15 @@ public class AccountController {
         return withAccount(exchange, account -> {
             AccountStore.IssuedTokens tokens = store.issueTokens(account.id(), request.operate());
             hub.disconnectAccount(account.id());
+            sessionQuota.revokeAccountSessions(account.id(), sessionId -> {
+                try {
+                    opsEndpoint.deleteSession(exchange, account, sessionId);
+                    return true;
+                } catch (RuntimeException e) {
+                    log.warn("Could not close a revoked MCP session for account {}: {}", account.id(), e.toString());
+                    return false;
+                }
+            });
             return ResponseEntity.ok(Map.<String, Object>of(
                     "connectorToken", tokens.connectorToken(),
                     "agentToken", tokens.agentToken(),

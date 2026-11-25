@@ -24,6 +24,10 @@
   <section class="card" id="status-card">
     <div class="status"><span class="dot" id="status-dot"></span><span id="status-text">Waiting for your application</span></div>
     <p class="muted" id="status-detail"></p>
+    <p class="muted" id="plan-note"></p>
+    <label for="cluster-select" id="cluster-picker-label" class="hidden">Cluster
+      <select id="cluster-select"></select>
+    </label>
     <div class="stats" id="stats"></div>
     <p class="muted hidden" id="stats-age" style="margin:12px 0 0"></p>
   </section>
@@ -46,7 +50,7 @@
     </div>
     <div class="check-row">
       <input type="checkbox" id="operate">
-      <label for="operate" style="margin:0;font-weight:400">Allow operate actions: requeue, delete and trigger jobs. Without it your agent can only read. Your application enforces this itself, based on the connector token.</label>
+      <label for="operate" style="margin:0;font-weight:400">Allow operate actions: requeue, delete and trigger jobs. Without it your agent can only read. The hub and your application enforce this using the connector token.</label>
     </div>
     <button class="btn" type="button" id="issue">Create tokens</button>
     <div class="alert error" id="tokens-error" role="alert"></div>

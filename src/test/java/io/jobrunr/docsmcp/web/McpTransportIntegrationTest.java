@@ -6,7 +6,7 @@ import io.jobrunr.docsmcp.index.VectorIndex;
 import io.jobrunr.docsmcp.hub.mcp.OpsMcpServerConfig;
 import io.jobrunr.docsmcp.model.DocsCatalog;
 import io.jobrunr.docsmcp.testsupport.DeterministicEmbeddingModel;
-import org.springframework.ai.mcp.server.webflux.transport.WebFluxStreamableServerTransportProvider;
+import org.springframework.ai.mcp.server.webflux.transport.WebFluxStatelessServerTransport;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.embedding.EmbeddingModel;
@@ -25,7 +25,6 @@ import tools.jackson.databind.ObjectMapper;
 import java.io.InputStream;
 import java.time.Duration;
 import java.util.List;
-import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -43,7 +42,7 @@ import static org.assertj.core.api.Assertions.assertThat;
         "docs.manifest-url=file:///jobrunr-docs-mcp-test/no-such-manifest.json",
         "docs.poll-interval=PT24H",
         "log.api.url=",
-        "trial.webhook-url=http://127.0.0.1:1/none",
+        "trial.webhook-url=",
         "ratelimit.enabled=false",
         "spring.ai.mcp.server.streamable-http.keep-alive-interval=1s",
 })
@@ -74,7 +73,7 @@ class McpTransportIntegrationTest {
     private VectorIndex vectorIndex;
 
     @Autowired
-    private WebFluxStreamableServerTransportProvider publicTransport;
+    private WebFluxStatelessServerTransport publicTransport;
 
     @Autowired
     private OpsMcpServerConfig.OpsMcpEndpoint opsEndpoint;
@@ -117,8 +116,8 @@ class McpTransportIntegrationTest {
 
     @Test
     void streamableTransportExecutesToolCall() {
-        String session = openSession();
-        JsonNode result = rpc(post(session, """
+        initialize();
+        JsonNode result = rpc(post("""
                 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
                   "name":"search_jobrunr_docs","arguments":{"query":"recurring jobs","limit":3}}}
                 """)).path("result");
@@ -131,8 +130,8 @@ class McpTransportIntegrationTest {
 
     @Test
     void unknownDocPathIsAToolErrorNotATransportError() {
-        String session = openSession();
-        JsonNode result = rpc(post(session, """
+        initialize();
+        JsonNode result = rpc(post("""
                 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
                   "name":"fetch_jobrunr_doc","arguments":{"path":"does-not-exist"}}}
                 """)).path("result");
@@ -162,28 +161,17 @@ class McpTransportIntegrationTest {
     }
 
     @Test
-    void deletedPublicSessionIsRemovedFromTransportMap() {
-        String session = openSession();
-        @SuppressWarnings("unchecked")
-        Map<String, ?> sessions = (Map<String, ?>) ReflectionTestUtils.getField(publicTransport, "sessions");
-        assertThat(sessions).containsKey(session);
-
-        client.delete().uri("/mcp")
-                .header("MCP-Protocol-Version", PROTOCOL)
-                .header("Mcp-Session-Id", session)
-                .exchange()
-                .expectStatus().is2xxSuccessful();
-
-        assertThat(sessions).doesNotContainKey(session);
+    void publicDocsDoNotIssueSessionIds() {
+        assertThat(publicTransport).isNotNull();
+        assertThat(initialize().getResponseHeaders().getFirst("Mcp-Session-Id")).isNull();
+        assertThat(initialize().getResponseHeaders().getFirst("Mcp-Session-Id")).isNull();
     }
 
     @Test
-    void bothMcpTransportsHaveSessionCapsAndIdleExpiry() {
-        assertThat(ReflectionTestUtils.getField(publicTransport, "maxSessions")).isEqualTo(2000L);
-        assertThat(ReflectionTestUtils.getField(publicTransport, "sessionIdleTimeout")).isEqualTo(Duration.ofHours(1));
+    void authenticatedOpsTransportHasSessionCapAndIdleExpiry() {
         Object opsTransport = ReflectionTestUtils.getField(opsEndpoint, "provider");
         assertThat(ReflectionTestUtils.getField(opsTransport, "maxSessions")).isEqualTo(2000L);
-        assertThat(ReflectionTestUtils.getField(opsTransport, "sessionIdleTimeout")).isEqualTo(Duration.ofHours(1));
+        assertThat(ReflectionTestUtils.getField(opsTransport, "sessionIdleTimeout")).isEqualTo(Duration.ofMinutes(30));
     }
 
     @Test
@@ -199,8 +187,8 @@ class McpTransportIntegrationTest {
     // -------------------------------------------------------------------- helpers
 
     private List<String> toolNamesOverStreamableHttp() {
-        String session = openSession();
-        JsonNode tools = rpc(post(session, """
+        initialize();
+        JsonNode tools = rpc(post("""
                 {"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}
                 """)).path("result").path("tools");
         return tools.valueStream().map(t -> t.path("name").stringValue()).toList();
@@ -218,27 +206,11 @@ class McpTransportIntegrationTest {
                 .returnResult();
     }
 
-    private String openSession() {
-        EntityExchangeResult<byte[]> result = initialize();
-        String session = result.getResponseHeaders().getFirst("Mcp-Session-Id");
-        assertThat(session).as("server must assign a session id").isNotBlank();
-        client.post().uri("/mcp")
-                .contentType(MediaType.APPLICATION_JSON)
-                .accept(MediaType.APPLICATION_JSON, MediaType.TEXT_EVENT_STREAM)
-                .header("MCP-Protocol-Version", PROTOCOL)
-                .header("Mcp-Session-Id", session)
-                .bodyValue("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")
-                .exchange()
-                .expectStatus().is2xxSuccessful();
-        return session;
-    }
-
-    private EntityExchangeResult<byte[]> post(String session, String body) {
+    private EntityExchangeResult<byte[]> post(String body) {
         return client.post().uri("/mcp")
                 .contentType(MediaType.APPLICATION_JSON)
                 .accept(MediaType.APPLICATION_JSON, MediaType.TEXT_EVENT_STREAM)
                 .header("MCP-Protocol-Version", PROTOCOL)
-                .header("Mcp-Session-Id", session)
                 .bodyValue(body)
                 .exchange()
                 .expectStatus().isOk()
