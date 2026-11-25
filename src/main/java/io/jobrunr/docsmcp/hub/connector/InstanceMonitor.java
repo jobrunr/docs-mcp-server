@@ -154,7 +154,11 @@ public class InstanceMonitor {
         if (account == null) return;
 
         JsonNode clusterMetadata = get(node, "/api/metadata/id/cluster");
-        String clusterId = clusterMetadata != null && clusterMetadata.path("value").isString() ? clusterMetadata.path("value").stringValue() : null;
+        // The connector can start before the BackgroundJobServer writes its cluster metadata.
+        // Keep the node unready and let retryUnreadyNodes check again; rejecting it here makes
+        // the connector's next poll fail permanently with 409 after an ordinary startup race.
+        if (clusterMetadata == null) return;
+        String clusterId = clusterMetadata.path("value").isString() ? clusterMetadata.path("value").stringValue() : null;
         if (clusterId == null || !CLUSTER_ID.matcher(clusterId).matches()) {
             node.reject("The connector did not return a valid JobRunr cluster id.");
             return;
