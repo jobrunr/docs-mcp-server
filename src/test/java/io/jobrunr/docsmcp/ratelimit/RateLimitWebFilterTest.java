@@ -67,6 +67,35 @@ class RateLimitWebFilterTest {
         }
     }
 
+    @Test
+    void newIpsShareAnOverflowLimitAfterTheBucketCapWithoutResettingExistingIps() {
+        RateLimitWebFilter filter = new RateLimitWebFilter(true, 2, 2);
+        filter.filter(exchange("1.1.1.1", "/mcp"), PASS).block();
+        filter.filter(exchange("2.2.2.2", "/mcp"), PASS).block();
+        filter.filter(exchange("3.3.3.3", "/mcp"), PASS).block();
+        filter.filter(exchange("4.4.4.4", "/mcp"), PASS).block();
+
+        MockServerWebExchange overflow = exchange("5.5.5.5", "/mcp");
+        filter.filter(overflow, PASS).block();
+        assertThat(overflow.getResponse().getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+
+        filter.filter(exchange("1.1.1.1", "/mcp"), PASS).block();
+        MockServerWebExchange original = exchange("1.1.1.1", "/mcp");
+        filter.filter(original, PASS).block();
+        assertThat(original.getResponse().getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+    }
+
+    @Test
+    void overlongUntrustedIpHeadersShareABoundedKey() {
+        RateLimitWebFilter filter = new RateLimitWebFilter(true, 1, 2);
+        String prefix = "x".repeat(64);
+        filter.filter(exchange(prefix + "first", "/mcp"), PASS).block();
+
+        MockServerWebExchange second = exchange(prefix + "second", "/mcp");
+        filter.filter(second, PASS).block();
+        assertThat(second.getResponse().getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+    }
+
     private MockServerWebExchange exchange(String flyClientIp, String path) {
         return MockServerWebExchange.from(MockServerHttpRequest
                 .get(path)

@@ -105,7 +105,8 @@ public class AccountController {
                     .orElseGet(() -> {
                         // Keep the HTTP answer indistinguishable, but leave a domain-only clue for operators
                         // when a deployment lost its account database.
-                        log.debug("Sign-in requested for an unknown account at domain {}", email.substring(email.lastIndexOf('@') + 1));
+                        log.debug("Sign-in link not sent: no account found at domain {}. Check HUB_DB_URL and /app/data persistence if this is a known user.",
+                                email.substring(email.lastIndexOf('@') + 1));
                         return ResponseEntity.ok(Map.of("status", "check-your-inbox"));
                     });
         });
