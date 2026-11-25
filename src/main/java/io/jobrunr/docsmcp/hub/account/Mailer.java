@@ -53,7 +53,7 @@ public class Mailer {
         }
     }
 
-    private String body(Account account, String link, boolean firstTime) {
+    String body(Account account, String link, boolean firstTime) {
         String title = firstTime ? "Confirm your email" : "Sign in to JobRunr MCP";
         String intro = firstTime
                 ? "Thanks for signing up for JobRunr MCP, " + account.name() + ". Confirm your email to get your connector and agent tokens."
@@ -112,6 +112,23 @@ public class Mailer {
                 </table>
                 </body>
                 </html>
-                """.formatted(logoUrl, title, intro, minutes, link, button, link, link);
+                """.formatted(escapeHtml(logoUrl), escapeHtml(title), escapeHtml(intro), minutes,
+                escapeHtml(link), escapeHtml(button), escapeHtml(link), escapeHtml(link));
+    }
+
+    private static String escapeHtml(String value) {
+        StringBuilder escaped = new StringBuilder(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            char ch = value.charAt(i);
+            switch (ch) {
+                case '&' -> escaped.append("&amp;");
+                case '<' -> escaped.append("&lt;");
+                case '>' -> escaped.append("&gt;");
+                case '"' -> escaped.append("&quot;");
+                case '\'' -> escaped.append("&#39;");
+                default -> escaped.append(ch);
+            }
+        }
+        return escaped.toString();
     }
 }

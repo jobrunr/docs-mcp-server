@@ -29,9 +29,14 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
@@ -181,6 +186,69 @@ class OpsHubIntegrationTest {
                 .allSatisfy(e -> assertThat(String.valueOf(e.arguments())).doesNotContain(FAILED_JOB_1, "invoice"));
         assertThat(logged.stream().filter(e -> e.toolName().equals("requeue_jobs")).toList())
                 .allSatisfy(e -> assertThat(e.arguments()).containsEntry("job_ids_count", 2));
+    }
+
+    @Test
+    void aVerifiedUserCanRequestANewSignInLinkImmediatelyAfterSigningOut() {
+        String email = "signin" + System.nanoTime() + "@acme.io";
+        client.post().uri("/api/signup").contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(Map.of("name", "Jane", "email", email, "company", "Acme"))
+                .exchange().expectStatus().isOk();
+        String signupLink = mailer.lastLinkFor(email);
+        assertThat(signupLink).isNotNull();
+
+        var verified = client.post().uri("/api/verify").contentType(MediaType.APPLICATION_JSON)
+                .header("X-Forwarded-Proto", "https")
+                .bodyValue(Map.of("token", signupLink.substring(signupLink.indexOf('#') + 1)))
+                .exchange().expectStatus().isOk()
+                .returnResult(String.class);
+        // The public URL is HTTP in this test, so a spoofed forwarding header cannot
+        // change the session cookie's Secure flag.
+        assertThat(verified.getResponseCookies().getFirst("jr_mcp_session").isSecure()).isFalse();
+        String sessionCookie = verified.getResponseCookies().getFirst("jr_mcp_session").getValue();
+        client.post().uri("/api/signout").cookie("jr_mcp_session", sessionCookie)
+                .exchange().expectStatus().isNoContent();
+
+        client.post().uri("/api/signin").contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(Map.of("email", email)).exchange().expectStatus().isOk();
+        String signInLink = mailer.lastLinkFor(email);
+        assertThat(signInLink).isNotEqualTo(signupLink);
+        client.post().uri("/api/verify").contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(Map.of("token", signInLink.substring(signInLink.indexOf('#') + 1)))
+                .exchange().expectStatus().isOk();
+    }
+
+    @Test
+    void anUnknownSignInAddressGetsTheSameGenericAnswerWithoutMail() {
+        String email = "missing" + System.nanoTime() + "@acme.io";
+        JsonNode reply = MAPPER.readTree(client.post().uri("/api/signin").contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(Map.of("email", email)).exchange().expectStatus().isOk()
+                .expectBody(String.class).returnResult().getResponseBody());
+        assertThat(reply.path("status").stringValue()).isEqualTo("check-your-inbox");
+        assertThat(mailer.lastLinkFor(email)).isNull();
+    }
+
+    @Test
+    void simultaneousTokenIssuanceLeavesOneCurrentPair() throws Exception {
+        Account account = store.create("race" + System.nanoTime() + "@acme.io", "Jane", "Acme", null, null);
+        CyclicBarrier barrier = new CyclicBarrier(8);
+        List<AccountStore.IssuedTokens> issued = new ArrayList<>();
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            List<Future<AccountStore.IssuedTokens>> futures = new ArrayList<>();
+            for (int i = 0; i < 8; i++) {
+                futures.add(executor.submit(() -> {
+                    barrier.await(10, TimeUnit.SECONDS);
+                    return store.issueTokens(account.id(), false);
+                }));
+            }
+            for (Future<AccountStore.IssuedTokens> future : futures) {
+                issued.add(future.get(20, TimeUnit.SECONDS));
+            }
+        }
+
+        assertThat(store.activeTokens(account.id())).hasSize(2);
+        assertThat(issued.stream().filter(pair -> store.findActiveToken(pair.agentToken(), AccountStore.KIND_AGENT).isPresent())).hasSize(1);
+        assertThat(issued.stream().filter(pair -> store.findActiveToken(pair.connectorToken(), AccountStore.KIND_CONNECTOR).isPresent())).hasSize(1);
     }
 
     @Test

@@ -9,9 +9,13 @@ CREATE TABLE IF NOT EXISTS hub_accounts (
     job_role    VARCHAR(200),
     use_case    VARCHAR(1000),
     cluster_id  VARCHAR(64),
+    is_pro      BOOLEAN      NOT NULL DEFAULT FALSE,
     created_at  TIMESTAMP     NOT NULL,
     verified_at TIMESTAMP
 );
+
+-- Existing H2 and PostgreSQL installations were created before is_pro existed.
+ALTER TABLE hub_accounts ADD COLUMN IF NOT EXISTS is_pro BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE TABLE IF NOT EXISTS hub_tokens (
     id           VARCHAR(36)  PRIMARY KEY,
@@ -23,6 +27,29 @@ CREATE TABLE IF NOT EXISTS hub_tokens (
     created_at   TIMESTAMP    NOT NULL,
     revoked_at   TIMESTAMP
 );
+
+-- One current token of each kind per account, independent of the historical rows above.
+-- Backfill existing installations on startup, selecting the newest still-active token.
+CREATE TABLE IF NOT EXISTS hub_current_tokens (
+    account_id VARCHAR(36) NOT NULL,
+    kind       VARCHAR(16) NOT NULL,
+    token_hash VARCHAR(64) NOT NULL UNIQUE,
+    PRIMARY KEY (account_id, kind)
+);
+
+INSERT INTO hub_current_tokens (account_id, kind, token_hash)
+SELECT recent.account_id, recent.kind, recent.token_hash
+FROM (
+    SELECT t.account_id, t.kind, t.token_hash,
+           ROW_NUMBER() OVER (PARTITION BY t.account_id, t.kind ORDER BY t.created_at DESC, t.id DESC) AS rn
+    FROM hub_tokens t
+    WHERE t.revoked_at IS NULL
+) recent
+WHERE recent.rn = 1
+  AND NOT EXISTS (
+      SELECT 1 FROM hub_current_tokens slot
+      WHERE slot.account_id = recent.account_id AND slot.kind = recent.kind
+  );
 
 CREATE TABLE IF NOT EXISTS hub_magic_links (
     token_hash VARCHAR(64) PRIMARY KEY,

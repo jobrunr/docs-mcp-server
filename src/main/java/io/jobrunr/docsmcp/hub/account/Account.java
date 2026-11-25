@@ -11,10 +11,11 @@ public record Account(
         String useCase,
         String clusterId,
         Instant createdAt,
-        Instant verifiedAt) {
+        Instant verifiedAt,
+        boolean proEnabled) {
 
     public Account withClusterId(String clusterId) {
-        return new Account(id, email, name, company, role, useCase, clusterId, createdAt, verifiedAt);
+        return new Account(id, email, name, company, role, useCase, clusterId, createdAt, verifiedAt, proEnabled);
     }
 
     public String emailDomain() {

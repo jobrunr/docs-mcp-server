@@ -18,14 +18,15 @@ import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
+import java.net.URI;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.Callable;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 
 /**
@@ -41,6 +42,7 @@ public class AccountController {
     private static final Pattern EMAIL = Pattern.compile("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$");
     private static final Duration EMAIL_COOLDOWN = Duration.ofSeconds(60);
     private static final int MAX_LINKS_PER_IP_PER_HOUR = 10;
+    private static final int MAX_RATE_LIMIT_KEYS = 10_000;
 
     private final AccountStore store;
     private final Mailer mailer;
@@ -48,8 +50,8 @@ public class AccountController {
     private final ConnectorHub hub;
     private final InstanceMonitor monitor;
     private final HubProperties properties;
-    private final Map<String, Instant> lastLinkPerEmail = new ConcurrentHashMap<>();
-    private final Map<String, List<Instant>> linksPerIp = new ConcurrentHashMap<>();
+    private final Map<String, Instant> lastLinkPerEmail = boundedMap(MAX_RATE_LIMIT_KEYS);
+    private final Map<String, List<Instant>> linksPerIp = boundedMap(MAX_RATE_LIMIT_KEYS);
 
     public AccountController(AccountStore store, Mailer mailer, LeadEvents leadEvents, ConnectorHub hub, InstanceMonitor monitor, HubProperties properties) {
         this.store = store;
@@ -100,7 +102,12 @@ public class AccountController {
             // same answer whether or not the account exists, so the form cannot be used to probe for accounts
             return store.findByEmail(email)
                     .map(account -> sendLink(account, account.verifiedAt() == null))
-                    .orElseGet(() -> ResponseEntity.ok(Map.of("status", "check-your-inbox")));
+                    .orElseGet(() -> {
+                        // Keep the HTTP answer indistinguishable, but leave a domain-only clue for operators
+                        // when a deployment lost its account database.
+                        log.debug("Sign-in requested for an unknown account at domain {}", email.substring(email.lastIndexOf('@') + 1));
+                        return ResponseEntity.ok(Map.of("status", "check-your-inbox"));
+                    });
         });
     }
 
@@ -116,9 +123,12 @@ public class AccountController {
                 leadEvents.record(account.get(), LeadEvents.VERIFIED, account.get().useCase(), ClientIpExtractor.from(exchange.getRequest()));
             }
             String session = store.createSession(account.get().id(), properties.sessionTtl());
+            // This user proved mailbox access. A just-verified signup can sign in again
+            // immediately after signing out without hitting the preceding signup cooldown.
+            releaseLinkCooldown(account.get().email());
             exchange.getResponse().addCookie(ResponseCookie.from(SESSION_COOKIE, session)
                     .httpOnly(true)
-                    .secure(isHttps(exchange))
+                    .secure(secureCookie())
                     .sameSite("Lax")
                     .path("/")
                     .maxAge(properties.sessionTtl())
@@ -132,7 +142,8 @@ public class AccountController {
         var cookie = exchange.getRequest().getCookies().getFirst(SESSION_COOKIE);
         return blocking(() -> {
             if (cookie != null) store.deleteSession(cookie.getValue());
-            exchange.getResponse().addCookie(ResponseCookie.from(SESSION_COOKIE, "").path("/").maxAge(0).build());
+            exchange.getResponse().addCookie(ResponseCookie.from(SESSION_COOKIE, "")
+                    .httpOnly(true).secure(secureCookie()).sameSite("Lax").path("/").maxAge(0).build());
             return ResponseEntity.noContent().build();
         });
     }
@@ -144,6 +155,7 @@ public class AccountController {
             body.put("name", account.name());
             body.put("email", account.email());
             body.put("company", account.company());
+            body.put("proEnabled", account.proEnabled());
             body.put("publicUrl", properties.publicUrl());
             body.put("tokens", store.activeTokens(account.id()));
             body.put("nodes", hub.onlineNodes(account.id()).stream().map(node -> {
@@ -199,25 +211,41 @@ public class AccountController {
         return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(Map.of("error", "This server cannot send email yet, so signups are paused. Please try again later."));
     }
 
-    private boolean allowLink(String email, ServerWebExchange exchange) {
+    private synchronized boolean allowLink(String email, ServerWebExchange exchange) {
         Instant now = Instant.now();
-        Instant last = lastLinkPerEmail.get(email.toLowerCase());
+        String normalizedEmail = email.toLowerCase(Locale.ROOT);
+        Instant last = lastLinkPerEmail.get(normalizedEmail);
         if (last != null && last.isAfter(now.minus(EMAIL_COOLDOWN))) return false;
 
         String ip = String.valueOf(ClientIpExtractor.from(exchange.getRequest()));
-        List<Instant> recent = linksPerIp.compute(ip, (key, list) -> {
-            List<Instant> kept = list == null ? new java.util.ArrayList<>() : new java.util.ArrayList<>(list.stream().filter(t -> t.isAfter(now.minus(Duration.ofHours(1)))).toList());
-            kept.add(now);
-            return kept;
-        });
-        if (recent.size() > MAX_LINKS_PER_IP_PER_HOUR) return false;
-        lastLinkPerEmail.put(email.toLowerCase(), now);
+        List<Instant> previous = linksPerIp.get(ip);
+        List<Instant> recent = previous == null ? new java.util.ArrayList<>()
+                : new java.util.ArrayList<>(previous.stream().filter(t -> t.isAfter(now.minus(Duration.ofHours(1)))).toList());
+        if (recent.size() >= MAX_LINKS_PER_IP_PER_HOUR) {
+            linksPerIp.put(ip, recent);
+            return false;
+        }
+        recent.add(now);
+        linksPerIp.put(ip, recent);
+        lastLinkPerEmail.put(normalizedEmail, now);
         return true;
     }
 
-    private static boolean isHttps(ServerWebExchange exchange) {
-        String forwardedProto = exchange.getRequest().getHeaders().getFirst("X-Forwarded-Proto");
-        return "https".equalsIgnoreCase(forwardedProto) || "https".equalsIgnoreCase(exchange.getRequest().getURI().getScheme());
+    private synchronized void releaseLinkCooldown(String email) {
+        lastLinkPerEmail.remove(email.toLowerCase(Locale.ROOT));
+    }
+
+    private boolean secureCookie() {
+        return "https".equalsIgnoreCase(URI.create(properties.publicUrl()).getScheme());
+    }
+
+    private static <V> Map<String, V> boundedMap(int maximumSize) {
+        return new LinkedHashMap<>(128, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, V> eldest) {
+                return size() > maximumSize;
+            }
+        };
     }
 
     private static <T> Mono<T> blocking(Callable<T> callable) {
@@ -229,7 +257,7 @@ public class AccountController {
     }
 
     private static ResponseEntity<Map<String, Object>> tooManyRequests() {
-        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(Map.of("error", "We just sent you a link. Check your inbox, or try again in a minute."));
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(Map.of("error", "Too many link requests. Check your inbox, or try again later."));
     }
 
     private static String trim(String value, int max) {

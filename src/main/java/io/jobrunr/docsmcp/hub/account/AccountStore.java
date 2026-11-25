@@ -10,6 +10,7 @@ import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -35,15 +36,20 @@ public class AccountStore {
     }
 
     public Optional<Account> findByEmail(String email) {
-        return jdbc.sql("SELECT * FROM hub_accounts WHERE email = ?").param(email.toLowerCase()).query(AccountStore::account).optional();
+        return jdbc.sql("SELECT * FROM hub_accounts WHERE email = ?").param(email.toLowerCase(Locale.ROOT)).query(AccountStore::account).optional();
     }
 
     public Account create(String email, String name, String company, String role, String useCase) {
         String id = UUID.randomUUID().toString();
         jdbc.sql("INSERT INTO hub_accounts (id, email, name, company, job_role, use_case, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-                .params(id, email.toLowerCase(), name, company, role, useCase, ts(Instant.now()))
+                .params(id, email.toLowerCase(Locale.ROOT), name, company, role, useCase, ts(Instant.now()))
                 .update();
         return findById(id).orElseThrow();
+    }
+
+    /** Server-side provisioning only. There is intentionally no public endpoint for this flag. */
+    public void setProEnabled(String accountId, boolean enabled) {
+        jdbc.sql("UPDATE hub_accounts SET is_pro = ? WHERE id = ?").params(enabled, accountId).update();
     }
 
     /** @return true if this call verified the account, false if it was verified before */
@@ -110,12 +116,21 @@ public class AccountStore {
     /** Revokes the current tokens of the account and issues a new connector and agent token. */
     @Transactional
     public IssuedTokens issueTokens(String accountId, boolean operate) {
+        // Serialize replacement for this account across concurrent HTTP requests and replicas.
+        jdbc.sql("SELECT id FROM hub_accounts WHERE id = ? FOR UPDATE")
+                .param(accountId).query(String.class).optional()
+                .orElseThrow(() -> new IllegalArgumentException("Unknown account: " + accountId));
         Instant now = Instant.now();
         jdbc.sql("UPDATE hub_tokens SET revoked_at = ? WHERE account_id = ? AND revoked_at IS NULL").params(ts(now), accountId).update();
+        jdbc.sql("DELETE FROM hub_current_tokens WHERE account_id = ?").param(accountId).update();
         String connectorToken = Tokens.connectorToken(operate);
         String agentToken = Tokens.agentToken();
         insertToken(accountId, KIND_CONNECTOR, operate ? "operate" : "read", connectorToken, now);
         insertToken(accountId, KIND_AGENT, null, agentToken, now);
+        jdbc.sql("INSERT INTO hub_current_tokens (account_id, kind, token_hash) VALUES (?, ?, ?)")
+                .params(accountId, KIND_CONNECTOR, Tokens.hash(connectorToken)).update();
+        jdbc.sql("INSERT INTO hub_current_tokens (account_id, kind, token_hash) VALUES (?, ?, ?)")
+                .params(accountId, KIND_AGENT, Tokens.hash(agentToken)).update();
         return new IssuedTokens(connectorToken, agentToken);
     }
 
@@ -126,14 +141,22 @@ public class AccountStore {
     }
 
     public Optional<TokenOwner> findActiveToken(String token, String kind) {
-        return jdbc.sql("SELECT account_id, scope FROM hub_tokens WHERE token_hash = ? AND kind = ? AND revoked_at IS NULL")
+        return jdbc.sql("""
+                        SELECT t.account_id, t.scope FROM hub_tokens t
+                        JOIN hub_current_tokens slot ON slot.token_hash = t.token_hash
+                        WHERE t.token_hash = ? AND t.kind = ? AND t.revoked_at IS NULL
+                        """)
                 .params(Tokens.hash(token), kind)
                 .query((rs, i) -> new TokenOwner(rs.getString("account_id"), rs.getString("scope")))
                 .optional();
     }
 
     public List<TokenInfo> activeTokens(String accountId) {
-        return jdbc.sql("SELECT kind, scope, hint, created_at FROM hub_tokens WHERE account_id = ? AND revoked_at IS NULL ORDER BY kind")
+        return jdbc.sql("""
+                        SELECT t.kind, t.scope, t.hint, t.created_at FROM hub_tokens t
+                        JOIN hub_current_tokens slot ON slot.token_hash = t.token_hash
+                        WHERE t.account_id = ? AND t.revoked_at IS NULL ORDER BY t.kind
+                        """)
                 .param(accountId)
                 .query((rs, i) -> new TokenInfo(rs.getString("kind"), rs.getString("scope"), rs.getString("hint"), instant(rs, "created_at")))
                 .list();
@@ -217,7 +240,7 @@ public class AccountStore {
     private static Account account(ResultSet rs, int rowNum) throws SQLException {
         return new Account(rs.getString("id"), rs.getString("email"), rs.getString("name"), rs.getString("company"),
                 rs.getString("job_role"), rs.getString("use_case"), rs.getString("cluster_id"),
-                instant(rs, "created_at"), instant(rs, "verified_at"));
+                instant(rs, "created_at"), instant(rs, "verified_at"), rs.getBoolean("is_pro"));
     }
 
     private static Timestamp ts(Instant instant) {
