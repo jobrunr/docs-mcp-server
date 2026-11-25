@@ -229,6 +229,18 @@ class OpsHubIntegrationTest {
     }
 
     @Test
+    void accountPagesLoadExternalScriptsUnderTheCsp() {
+        client.get().uri("/signup").exchange().expectStatus().isOk()
+                .expectHeader().value("Content-Security-Policy",
+                        csp -> assertThat(csp).contains("script-src 'self'").doesNotContain("script-src 'unsafe-inline'"))
+                .expectBody(String.class).value(html -> assertThat(html).contains("<script defer src=\"/signup.js\"></script>"));
+        client.get().uri("/signup.js").exchange().expectStatus().isOk()
+                .expectBody(String.class).value(script -> assertThat(script).contains("signup-form"));
+        client.get().uri("/account.js").exchange().expectStatus().isOk();
+        client.get().uri("/verify.js").exchange().expectStatus().isOk();
+    }
+
+    @Test
     void simultaneousTokenIssuanceLeavesOneCurrentPair() throws Exception {
         Account account = store.create("race" + System.nanoTime() + "@acme.io", "Jane", "Acme", null, null);
         CyclicBarrier barrier = new CyclicBarrier(8);
