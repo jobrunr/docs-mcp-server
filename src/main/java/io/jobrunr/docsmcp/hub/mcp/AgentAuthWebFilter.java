@@ -8,13 +8,16 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
+import org.springframework.util.StringUtils;
 import org.springframework.web.server.ServerWebExchange;
 import org.springframework.web.server.WebFilter;
 import org.springframework.web.server.WebFilterChain;
+import org.springframework.web.util.UriUtils;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.nio.charset.StandardCharsets;
+import java.util.regex.Pattern;
 
 /**
  * One public MCP url, two servers behind it. Requests to {@code /mcp} without an agent token keep reaching the docs
@@ -28,6 +31,7 @@ public class AgentAuthWebFilter implements WebFilter {
     public static final String PUBLIC_ENDPOINT = "/mcp";
     public static final String OPS_ENDPOINT = "/mcp-ops";
     public static final String ACCOUNT_ATTRIBUTE = "io.jobrunr.docsmcp.hub.account";
+    private static final Pattern MATRIX_PARAMETERS = Pattern.compile(";[^/]*");
 
     private final AccountStore store;
 
@@ -38,7 +42,7 @@ public class AgentAuthWebFilter implements WebFilter {
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
         String path = exchange.getRequest().getPath().value();
-        if (OPS_ENDPOINT.equals(path)) {
+        if (isInternalOpsPath(path)) {
             // only reachable through /mcp with a valid agent token
             exchange.getResponse().setStatusCode(HttpStatus.NOT_FOUND);
             return exchange.getResponse().setComplete();
@@ -52,6 +56,25 @@ public class AgentAuthWebFilter implements WebFilter {
         return Mono.fromCallable(() -> store.findActiveToken(token, AccountStore.KIND_AGENT).flatMap(owner -> store.findById(owner.accountId())))
                 .subscribeOn(Schedulers.boundedElastic())
                 .flatMap(account -> account.isPresent() ? routeToOpsServer(exchange, chain, account.get()) : unauthorized(exchange));
+    }
+
+    /** WebFlux route matching decodes path segments; compare the same canonical path before routing. */
+    static boolean isInternalOpsPath(String rawPath) {
+        String path = rawPath;
+        for (int i = 0; i < 4; i++) {
+            String withoutMatrixParams = MATRIX_PARAMETERS.matcher(path).replaceAll("");
+            String normalized = StringUtils.cleanPath(withoutMatrixParams);
+            if (OPS_ENDPOINT.equals(normalized) || (OPS_ENDPOINT + "/").equals(normalized)) return true;
+            String decoded;
+            try {
+                decoded = UriUtils.decode(path, StandardCharsets.UTF_8);
+            } catch (IllegalArgumentException e) {
+                return false;
+            }
+            if (decoded.equals(path)) return false;
+            path = decoded;
+        }
+        return false;
     }
 
     private Mono<Void> routeToOpsServer(ServerWebExchange exchange, WebFilterChain chain, Account account) {

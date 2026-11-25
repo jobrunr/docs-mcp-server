@@ -56,7 +56,7 @@ public class OpsSessionQuotaWebFilter implements WebFilter {
 
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
-        if (!AgentAuthWebFilter.OPS_ENDPOINT.equals(exchange.getRequest().getPath().value())) {
+        if (!AgentAuthWebFilter.isInternalOpsPath(exchange.getRequest().getPath().value())) {
             return chain.filter(exchange);
         }
         Account account = exchange.getAttribute(AgentAuthWebFilter.ACCOUNT_ATTRIBUTE);
@@ -71,7 +71,9 @@ public class OpsSessionQuotaWebFilter implements WebFilter {
                     .doFinally(signal -> finishInitialization(exchange, accountId));
         }
         if (sessionId != null) {
-            if (!ownedBy(sessionId, accountId)) return reject(exchange, HttpStatus.NOT_FOUND, "MCP session not found");
+            if (!ownedBy(sessionId, accountId, exchange.getRequest().getMethod())) {
+                return reject(exchange, HttpStatus.NOT_FOUND, "MCP session not found");
+            }
             return chain.filter(exchange)
                     .doFinally(signal -> finishExistingRequest(exchange, sessionId, accountId));
         }
@@ -94,14 +96,15 @@ public class OpsSessionQuotaWebFilter implements WebFilter {
         }
     }
 
-    private boolean ownedBy(String sessionId, String accountId) {
+    private boolean ownedBy(String sessionId, String accountId, HttpMethod method) {
         synchronized (owners) {
             purgeExpired();
             SessionOwner owner = owners.get(sessionId);
             if (owner == null || !owner.accountId.equals(accountId)) return false;
             // Keep a long-running tool call allocated from its start, even before
-            // the transport sends its response.
-            owners.put(sessionId, new SessionOwner(accountId, Instant.now()));
+            // the transport sends its response. Unsupported HTTP methods do not
+            // reach the SDK and must not refresh an abandoned session.
+            if (isSessionMethod(method)) owners.put(sessionId, new SessionOwner(accountId, Instant.now()));
             return true;
         }
     }
@@ -120,17 +123,24 @@ public class OpsSessionQuotaWebFilter implements WebFilter {
 
     private void finishExistingRequest(ServerWebExchange exchange, String sessionId, String accountId) {
         synchronized (owners) {
-            boolean successfulDelete = HttpMethod.DELETE.equals(exchange.getRequest().getMethod()) &&
-                    exchange.getResponse().getStatusCode() != null &&
-                    exchange.getResponse().getStatusCode().is2xxSuccessful();
-            if (successfulDelete || HttpStatus.NOT_FOUND.equals(exchange.getResponse().getStatusCode())) {
+            HttpMethod method = exchange.getRequest().getMethod();
+            var status = exchange.getResponse().getStatusCode();
+            boolean successfulDelete = HttpMethod.DELETE.equals(method) && status != null && status.is2xxSuccessful();
+            // The SDK's GET, POST and DELETE routes return 404 only when this
+            // session is absent. A 404 for PUT/PATCH comes from the router while
+            // the SDK session may still be live, so it cannot free a quota slot.
+            boolean sdkSessionMissing = isSessionMethod(method) && HttpStatus.NOT_FOUND.equals(status);
+            if (successfulDelete || sdkSessionMissing) {
                 owners.remove(sessionId);
-            } else if (exchange.getResponse().getStatusCode() != null &&
-                    exchange.getResponse().getStatusCode().is2xxSuccessful()) {
+            } else if (isSessionMethod(method) && status != null && status.is2xxSuccessful()) {
                 owners.computeIfPresent(sessionId, (key, current) ->
                         current.accountId.equals(accountId) ? new SessionOwner(accountId, Instant.now()) : current);
             }
         }
+    }
+
+    private static boolean isSessionMethod(HttpMethod method) {
+        return HttpMethod.GET.equals(method) || HttpMethod.POST.equals(method) || HttpMethod.DELETE.equals(method);
     }
 
     @Scheduled(fixedDelay = 60_000)

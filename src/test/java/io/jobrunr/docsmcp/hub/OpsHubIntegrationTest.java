@@ -30,6 +30,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -259,6 +260,31 @@ class OpsHubIntegrationTest {
     }
 
     @Test
+    void accountPagePrunesOldDisconnectedClusterSnapshotsButKeepsTheDefault() {
+        Account account = store.create("snapshot-history-" + System.nanoTime() + "@example.test", "History", "Example", null, null);
+        store.setProEnabled(account.id(), true);
+        store.claimClusterIfUnlinked(account.id(), "default-cluster");
+        Instant base = Instant.now().minusSeconds(100);
+        store.saveInstance(snapshot(account.id(), "default-cluster", base));
+        for (int i = 0; i < 40; i++) {
+            store.saveInstance(snapshot(account.id(), "historical-" + i, base.plusSeconds(i + 1)));
+        }
+        assertThat(store.findInstances(account.id())).hasSize(41);
+        store.pruneDisconnectedSnapshots(account.id(), Set.of("historical-0"));
+        assertThat(store.findInstances(account.id()).stream()
+                .map(AccountStore.InstanceSnapshot::clusterId).toList()).contains("historical-0");
+
+        String cookie = store.createSession(account.id(), Duration.ofHours(1));
+        JsonNode page = accountPage(cookie);
+        assertThat(page.path("instances")).hasSize(1 + AccountStore.MAX_DISCONNECTED_SNAPSHOTS);
+        assertThat(store.findInstances(account.id())).hasSize(1 + AccountStore.MAX_DISCONNECTED_SNAPSHOTS);
+        List<String> retained = store.findInstances(account.id()).stream()
+                .map(AccountStore.InstanceSnapshot::clusterId).toList();
+        assertThat(retained).contains("default-cluster", "historical-39")
+                .doesNotContain("historical-0", "historical-7");
+    }
+
+    @Test
     void simultaneousTokenIssuanceLeavesOneCurrentPair() throws Exception {
         Account account = store.create("race" + System.nanoTime() + "@acme.io", "Jane", "Acme", null, null);
         CyclicBarrier barrier = new CyclicBarrier(8);
@@ -419,6 +445,37 @@ class OpsHubIntegrationTest {
     }
 
     @Test
+    void ordinaryOssClusterCanReturnAfterAnotherClusterReplacedIt() throws Exception {
+        Account account = store.create("oss-return-" + System.nanoTime() + "@example.test", "OSS", "Example", null, null);
+        AccountStore.IssuedTokens issued = store.issueTokens(account.id(), false);
+        FakeConnector firstA = new FakeConnector("http://localhost:" + port, issued.connectorToken(),
+                "test-oss-a1", "oss-cluster-a", "9.1.1");
+        FakeConnector clusterB = new FakeConnector("http://localhost:" + port, issued.connectorToken(),
+                "test-oss-b1", "oss-cluster-b", "9.2.2");
+        FakeConnector returnedA = new FakeConnector("http://localhost:" + port, issued.connectorToken(),
+                "test-oss-a2", "oss-cluster-a", "9.3.3");
+        extraConnectors.addAll(List.of(firstA, clusterB, returnedA));
+
+        firstA.start();
+        waitForReadyNodes(account.id(), 1);
+        assertThat(store.findById(account.id()).orElseThrow().clusterId()).isEqualTo("oss-cluster-a");
+        firstA.stop();
+        waitForClusterOffline(account.id(), "oss-cluster-a");
+
+        clusterB.start();
+        waitForReadyNodes(account.id(), 1);
+        assertThat(store.findById(account.id()).orElseThrow().clusterId()).isEqualTo("oss-cluster-b");
+        clusterB.stop();
+        waitForClusterOffline(account.id(), "oss-cluster-b");
+
+        returnedA.start();
+        waitForReadyNodes(account.id(), 1);
+        assertThat(store.findById(account.id()).orElseThrow().clusterId()).isEqualTo("oss-cluster-a");
+        assertThat(callTool(issued.agentToken(), openSession(issued.agentToken()),
+                "get_cluster_overview", Map.of()).path("jobrunrVersion").stringValue()).isEqualTo("9.3.3");
+    }
+
+    @Test
     void proDowngradeTakesEffectInsideAnExistingMcpSessionWithoutClusterFallback() throws Exception {
         Account account = store.create("pro-downgrade-" + System.nanoTime() + "@example.test", "Pro", "Example", null, null);
         store.setProEnabled(account.id(), true);
@@ -478,8 +535,8 @@ class OpsHubIntegrationTest {
         waitForReadyNodes(account.id(), 1);
         extra.start();
         waitForReadyNodes(account.id(), 2);
-        assertThat(store.findInstance(account.id(), "partial-extra")).isPresent();
-        assertThat(store.findInstance(account.id(), "partial-extra").orElseThrow().jobsFailed()).isNull();
+        assertThat(store.hadProMultiCluster(account.id())).isTrue();
+        assertThat(store.findInstance(account.id(), "partial-extra")).isEmpty();
 
         store.setProEnabled(account.id(), false);
         for (int i = 0; i < 50 && extra.thread.isAlive(); i++) Thread.sleep(100);
@@ -543,6 +600,11 @@ class OpsHubIntegrationTest {
     private JsonNode accountPage(String sessionCookie) {
         return MAPPER.readTree(client.get().uri("/api/account").cookie("jr_mcp_session", sessionCookie)
                 .exchange().expectStatus().isOk().expectBody(String.class).returnResult().getResponseBody());
+    }
+
+    private static AccountStore.InstanceSnapshot snapshot(String accountId, String clusterId, Instant at) {
+        return new AccountStore.InstanceSnapshot(accountId, clusterId, "9.0.0", "21", "test",
+                null, false, null, null, null, null, null, null, null, null, at);
     }
 
     private JsonNode callTool(String agentToken, String session, String tool, Map<String, Object> arguments) {

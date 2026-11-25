@@ -12,6 +12,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -22,6 +23,7 @@ public class AccountStore {
 
     public static final String KIND_CONNECTOR = "connector";
     public static final String KIND_AGENT = "agent";
+    public static final int MAX_DISCONNECTED_SNAPSHOTS = 32;
 
     private final JdbcClient jdbc;
 
@@ -179,6 +181,17 @@ public class AccountStore {
             Instant firstConnectedAt, Instant snapshotAt) {
     }
 
+    /** A Pro account that connected an extra cluster keeps its original default pinned after downgrade. */
+    public void markProMultiClusterSeen(String accountId) {
+        jdbc.sql("UPDATE hub_accounts SET pro_multi_cluster_seen = TRUE WHERE id = ? AND pro_multi_cluster_seen = FALSE")
+                .param(accountId).update();
+    }
+
+    public boolean hadProMultiCluster(String accountId) {
+        return jdbc.sql("SELECT pro_multi_cluster_seen FROM hub_accounts WHERE id = ?")
+                .param(accountId).query(Boolean.class).optional().orElse(false);
+    }
+
     /** @return true if this is the first snapshot stored for this account and cluster */
     @Transactional
     public boolean saveInstance(InstanceSnapshot s) {
@@ -221,6 +234,25 @@ public class AccountStore {
     public List<InstanceSnapshot> findInstances(String accountId) {
         return jdbc.sql("SELECT * FROM hub_cluster_snapshots WHERE account_id = ? ORDER BY snapshot_at DESC")
                 .param(accountId).query(AccountStore::instance).list();
+    }
+
+    /** Keep every connected cluster plus the default, but only recent disconnected history. */
+    @Transactional
+    public int pruneDisconnectedSnapshots(String accountId, Set<String> connectedClusterIds) {
+        jdbc.sql("SELECT id FROM hub_accounts WHERE id = ? FOR UPDATE")
+                .param(accountId).query(String.class).optional().orElseThrow();
+        String defaultClusterId = findById(accountId).orElseThrow().clusterId();
+        List<String> ids = jdbc.sql("SELECT cluster_id FROM hub_cluster_snapshots WHERE account_id = ? ORDER BY snapshot_at DESC, cluster_id")
+                .param(accountId).query(String.class).list();
+        int disconnected = 0;
+        int removed = 0;
+        for (String id : ids) {
+            if (id.equals(defaultClusterId) || connectedClusterIds.contains(id)) continue;
+            if (++disconnected <= MAX_DISCONNECTED_SNAPSHOTS) continue;
+            removed += jdbc.sql("DELETE FROM hub_cluster_snapshots WHERE account_id = ? AND cluster_id = ?")
+                    .params(accountId, id).update();
+        }
+        return removed;
     }
 
     // ------------------------------------------------------------------ usage and lead events

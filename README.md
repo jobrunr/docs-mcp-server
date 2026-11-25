@@ -95,6 +95,8 @@ The same server is also the hub of the hosted JobRunr MCP for JobRunr OSS users.
 Accounts, SHA-256 hashes of tokens, sign-in links and sessions, one snapshot per connected cluster
 (versions, job counts, servers), tool call rows (tool name, success, latency, user agent) and lead events.
 It does not persist tool arguments, tool results or job data.
+The hub keeps the default and connected cluster snapshots plus at most 32 disconnected historical
+snapshots per account; older history is pruned when a new cluster is captured or the account page loads.
 
 Ops tool calls and lead events also go to the attribution DB `mcp_query_log`, marked `source = "ops"` and
 `source = "hub"` (tool `hub_<event>`) so the docs usage numbers stay separate. Each row names the account by email
@@ -158,7 +160,10 @@ UPDATE hub_accounts SET is_pro = TRUE WHERE id = '<account UUID>';
 
 To downgrade, set `is_pro = FALSE`. Existing MCP sessions read the current flag on every
 tool call. The original default cluster remains selected; extra Pro clusters are rejected
-on their next poll, and an OSS tool call never falls back to them. Pro's redaction option
+on their next poll, and an OSS tool call never falls back to them. Once an account has used
+multiple Pro clusters, `pro_multi_cluster_seen` keeps that default pinned after downgrade.
+An operator can clear this server-side fence after stopping extra connectors and rotating
+their tokens if automatic OSS cluster replacement is wanted. Pro's redaction option
 requires the separate proprietary JobRunr runtime; this OSS connector sends parameters as stored.
 
 `fly.toml` and `.github/workflows/deploy.yml` are left over from the Fly.io days and are not used.

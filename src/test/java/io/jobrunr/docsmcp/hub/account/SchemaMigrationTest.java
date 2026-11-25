@@ -50,9 +50,10 @@ class SchemaMigrationTest {
                     """);
             runCurrentSchema(connection); // startup SQL must remain safe on a second deployment
 
-            try (var account = statement.executeQuery("SELECT is_pro FROM hub_accounts WHERE id = 'legacy-account'")) {
+            try (var account = statement.executeQuery("SELECT is_pro, pro_multi_cluster_seen FROM hub_accounts WHERE id = 'legacy-account'")) {
                 assertThat(account.next()).isTrue();
                 assertThat(account.getBoolean("is_pro")).isFalse();
+                assertThat(account.getBoolean("pro_multi_cluster_seen")).isFalse();
             }
             try (var slots = statement.executeQuery("SELECT kind, token_hash FROM hub_current_tokens WHERE account_id = 'legacy-account' ORDER BY kind")) {
                 assertThat(slots.next()).isTrue();
@@ -69,6 +70,8 @@ class SchemaMigrationTest {
             assertThat(store.findActiveToken(oldAgentToken, AccountStore.KIND_AGENT)).isEmpty();
             store.setProEnabled("legacy-account", true);
             assertThat(store.findById("legacy-account").orElseThrow().proEnabled()).isTrue();
+            store.markProMultiClusterSeen("legacy-account");
+            assertThat(store.hadProMultiCluster("legacy-account")).isTrue();
             assertThat(store.findInstances("legacy-account")).hasSize(1);
             assertThat(store.findInstance("legacy-account", "legacy-cluster").orElseThrow().jobrunrVersion()).isEqualTo("8.0.0");
         }

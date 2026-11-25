@@ -115,7 +115,13 @@ public class OpsMcpServerConfig {
 
     @Bean
     public RouterFunction<?> opsMcpRouterFunction(OpsMcpEndpoint endpoint) {
-        return endpoint.routerFunction();
+        // The SDK route matcher decodes percent-encoded path characters. Enforce
+        // authentication at the matched ops route as well as in the path filters,
+        // so a variant such as /mcp%2Dops can never allocate an anonymous session.
+        return endpoint.routerFunction().filter((request, next) ->
+                request.attribute(AgentAuthWebFilter.ACCOUNT_ATTRIBUTE).orElse(null) instanceof Account
+                        ? next.handle(request).cast(ServerResponse.class)
+                        : ServerResponse.notFound().build());
     }
 
     public static final class OpsMcpEndpoint implements AutoCloseable {

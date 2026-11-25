@@ -28,6 +28,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.regex.Pattern;
 
@@ -167,10 +168,11 @@ public class AccountController {
             body.put("proEnabled", account.proEnabled());
             body.put("publicUrl", properties.publicUrl());
             body.put("tokens", store.activeTokens(account.id()));
-            body.put("nodes", hub.onlineNodes(account.id()).stream()
+            List<ConnectorHub.Node> visibleNodes = hub.onlineNodes(account.id()).stream()
                     .filter(ConnectorHub.Node::isReady)
                     .filter(node -> account.proEnabled() || account.clusterId() == null || account.clusterId().equals(node.clusterId()))
-                    .map(node -> {
+                    .toList();
+            body.put("nodes", visibleNodes.stream().map(node -> {
                 Map<String, Object> n = new LinkedHashMap<>();
                 n.put("clusterId", node.clusterId());
                 n.put("jobrunrVersion", node.info().jobrunrVersion());
@@ -181,6 +183,8 @@ public class AccountController {
                 n.put("lastSeenAt", node.lastPollAt());
                 return n;
             }).toList());
+            store.pruneDisconnectedSnapshots(account.id(), Set.copyOf(visibleNodes.stream()
+                    .map(ConnectorHub.Node::clusterId).toList()));
             List<AccountStore.InstanceSnapshot> instances = store.findInstances(account.id());
             if (!account.proEnabled()) {
                 instances = instances.stream()

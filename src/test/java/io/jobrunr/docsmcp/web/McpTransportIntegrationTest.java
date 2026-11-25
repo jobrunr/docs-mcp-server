@@ -23,8 +23,10 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.InputStream;
+import java.net.URI;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -182,6 +184,22 @@ class McpTransportIntegrationTest {
                 .bodyValue("{}")
                 .exchange()
                 .expectStatus().isNotFound();
+    }
+
+    @Test
+    void anonymousEncodedOpsPathsCannotAllocateASession() {
+        Object provider = ReflectionTestUtils.getField(opsEndpoint, "provider");
+        @SuppressWarnings("unchecked")
+        Map<String, ?> sessions = (Map<String, ?>) ReflectionTestUtils.getField(provider, "sessions");
+        int before = sessions.size();
+        for (String path : List.of("/mcp-ops", "/mcp%2Dops", "/mc%70-ops", "/mcp-ops;v=1", "/mcp%252Dops")) {
+            client.post().uri(URI.create("http://localhost:" + port + path))
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .accept(MediaType.APPLICATION_JSON, MediaType.TEXT_EVENT_STREAM)
+                    .bodyValue(INITIALIZE)
+                    .exchange().expectStatus().is4xxClientError();
+            assertThat(sessions).as(path + " must not create an ops MCP session").hasSize(before);
+        }
     }
 
     // -------------------------------------------------------------------- helpers

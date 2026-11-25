@@ -10,12 +10,14 @@ CREATE TABLE IF NOT EXISTS hub_accounts (
     use_case    VARCHAR(1000),
     cluster_id  VARCHAR(64),
     is_pro      BOOLEAN      NOT NULL DEFAULT FALSE,
+    pro_multi_cluster_seen BOOLEAN NOT NULL DEFAULT FALSE,
     created_at  TIMESTAMP     NOT NULL,
     verified_at TIMESTAMP
 );
 
 -- Existing H2 and PostgreSQL installations were created before is_pro existed.
 ALTER TABLE hub_accounts ADD COLUMN IF NOT EXISTS is_pro BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE hub_accounts ADD COLUMN IF NOT EXISTS pro_multi_cluster_seen BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE TABLE IF NOT EXISTS hub_tokens (
     id           VARCHAR(36)  PRIMARY KEY,

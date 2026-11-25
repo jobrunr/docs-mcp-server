@@ -181,10 +181,10 @@ public class InstanceMonitor {
                     }
                 } else {
                     String linkedId = account.clusterId();
-                    // A formerly Pro extra cluster already has a snapshot. On downgrade it
-                    // must not become the OSS default simply because its connector keeps
-                    // polling after the original default goes offline.
-                    if (store.findInstance(account.id(), clusterId).isPresent()) {
+                    // A Pro account that used more than one cluster keeps its original
+                    // default pinned on downgrade. Ordinary OSS history has no fence,
+                    // so A -> B -> A remains possible.
+                    if (store.hadProMultiCluster(account.id())) {
                         rejectSecondCluster(account, node, clusterId);
                         return;
                     }
@@ -207,15 +207,10 @@ public class InstanceMonitor {
                 rejectSecondCluster(account, node, clusterId);
                 return;
             }
-            if (account.proEnabled() && store.findInstance(account.id(), clusterId).isEmpty()) {
-                // Persist membership before making a Pro node routable. If the account is
-                // downgraded immediately afterward, its old extra cluster is already
-                // known and cannot be adopted as a free-tier replacement.
-                ConnectorHub.NodeInfo info = node.info();
-                store.saveInstance(new AccountStore.InstanceSnapshot(
-                        account.id(), clusterId, info.jobrunrVersion(), info.javaVersion(), info.framework(),
-                        null, info.redaction(), null, null, null, null, null, null, null,
-                        null, Instant.now()));
+            if (account.proEnabled() && !isLinkedTo(account.id(), clusterId)) {
+                // Persist the downgrade fence before an extra Pro node becomes
+                // routable. Failed stats snapshots cannot bypass it.
+                store.markProMultiClusterSeen(account.id());
             }
             // Registration alone is insufficient: route traffic only after cluster identity and
             // account membership have been checked under the same lock.
@@ -233,6 +228,12 @@ public class InstanceMonitor {
                 account.id(), clusterId, info.jobrunrVersion(), info.javaVersion(), info.framework(), storageProvider, info.redaction(),
                 servers != null && servers.isArray() ? servers.size() : null, total(recurringJobs),
                 counts[0], counts[1], counts[2], counts[3], counts[4], null, Instant.now()));
+
+        if (first) {
+            Set<String> connectedClusters = Set.copyOf(hub.onlineNodes(account.id()).stream()
+                    .filter(ConnectorHub.Node::isReady).map(ConnectorHub.Node::clusterId).toList());
+            store.pruneDisconnectedSnapshots(account.id(), connectedClusters);
+        }
 
         if (first || !store.hasLeadEvent(account.id(), LeadEvents.FIRST_CONNECTION)) {
             leadEvents.record(clusterId != null ? account.withClusterId(clusterId) : account, LeadEvents.FIRST_CONNECTION, "JobRunr " + info.jobrunrVersion() + ", " + info.framework()
