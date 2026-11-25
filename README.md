@@ -80,6 +80,12 @@ The same server is also the hub of the hosted JobRunr MCP for JobRunr OSS users.
 | `list_clusters` | Lists this account's connected clusters. Pro accounts can pass a listed `cluster_id` to every cluster tool; OSS uses its single default cluster. |
 | `search_jobs` | Pro feature hook; returns a `proFeature` hint. |
 
+`trigger_recurring_job` accepts an optional `request_id` (a caller-generated UUID or other 8–128 character URL-safe ID).
+Use a new ID for each intended run and reuse that ID only when retrying the same cluster and recurring job.
+The hub returns the first result or error for retries and sends at most one trigger while the receipt is retained.
+Receipts expire 15 minutes after completion and are kept in hub memory, so this guarantee does not span a hub restart
+or multiple hub processes. Omitting `request_id` preserves the original behavior: every call triggers a run.
+
 ### Pages and endpoints
 
 | Path | Purpose |

@@ -50,7 +50,8 @@ public class OpsMcpServerConfig {
             list_jobs, get_job, triage_failed_jobs, list_recurring_jobs, list_servers and get_problems. Operate tools
             (requeue_job, requeue_jobs, delete_job, trigger_recurring_job, dismiss_problem) change the cluster: only
             call them when the user asked for that outcome, and for more than one job always run requeue_jobs as a
-            dry run first and show the user the preview.
+            dry run first and show the user the preview. For trigger_recurring_job, use a fresh request_id for each
+            intended run and reuse that same ID only when retrying an uncertain result.
 
             On a JobRunr Pro account, list_clusters shows the connected clusters. Pass cluster_id from that
             list on a cluster tool to select one; omitting it uses the account's default cluster. On a free

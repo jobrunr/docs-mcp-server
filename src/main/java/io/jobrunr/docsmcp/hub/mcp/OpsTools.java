@@ -31,6 +31,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -38,7 +39,11 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.regex.Pattern;
 import java.util.stream.IntStream;
 
@@ -57,14 +62,19 @@ public class OpsTools {
     private static final int MAX_LIST_OFFSET = 10_000;
     private static final int MAX_PREVIEWS_PER_ACCOUNT = 20;
     private static final int MAX_PREVIEWS_GLOBAL = 2_000;
+    static final int MAX_TRIGGER_RECEIPTS_PER_ACCOUNT = 100;
+    static final int MAX_TRIGGER_RECEIPTS_GLOBAL = 2_000;
     private static final int MAX_STRING_LENGTH = 6_000;
     private static final int MAX_HISTORY = 10;
     private static final Duration PREVIEW_TTL = Duration.ofMinutes(15);
+    static final Duration TRIGGER_RECEIPT_TTL = Duration.ofMinutes(15);
+    private static final Duration TRIGGER_REPLAY_WAIT = Duration.ofMinutes(2).plusSeconds(5);
     private static final List<String> STATES = List.of("AWAITING", "SCHEDULED", "ENQUEUED", "PROCESSING", "FAILED", "SUCCEEDED", "DELETED");
     private static final List<String> OVERVIEW_STATES = List.of("SCHEDULED", "ENQUEUED", "PROCESSING", "FAILED", "SUCCEEDED");
     private static final Set<String> REQUEUEABLE_STATES = Set.of("FAILED", "SUCCEEDED", "DELETED", "SCHEDULED");
     private static final Pattern JOB_ID = Pattern.compile("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
     private static final Pattern RECURRING_JOB_ID = Pattern.compile("[\\dA-Za-z\\-_(),.]{1,127}");
+    private static final Pattern TRIGGER_REQUEST_ID = Pattern.compile("[A-Za-z0-9_-]{8,128}");
     private static final Pattern PROBLEM_TYPE = Pattern.compile("[a-z0-9-]{1,64}");
     private static final Pattern CLUSTER_ID = Pattern.compile("[A-Za-z0-9_-]{1,64}");
     private static final Pattern VOLATILE_PARTS = Pattern.compile("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|\\d+");
@@ -81,6 +91,8 @@ public class OpsTools {
     private final ObjectMapper objectMapper;
     private final McpJsonMapper mcpJsonMapper;
     private final Map<String, RequeuePreview> previews = new ConcurrentHashMap<>();
+    /** Guarded by itself so a receipt is checked and reserved atomically. */
+    private final Map<TriggerRequestKey, TriggerReceipt> triggerReceipts = new HashMap<>();
 
     public OpsTools(DashboardClient dashboard, ConnectorHub hub, AccountStore store, LeadEvents leadEvents, QueryLogClient queryLogClient,
                     ObjectMapper objectMapper, @Qualifier("mcpServerJsonMapper") JsonMapper mcpServerJsonMapper,
@@ -109,6 +121,29 @@ public class OpsTools {
 
     private record RequeuePreview(String accountId, String clusterId, Set<String> requestedIds,
                                   List<String> requeueableIds, Instant createdAt) {
+    }
+
+    private record TriggerRequestKey(String accountId, String requestId) {
+    }
+
+    private record TriggerOutcome(Object value, RuntimeException failure) {
+    }
+
+    private static final class TriggerReceipt {
+        private final String clusterId;
+        private final String recurringJobId;
+        private final CompletableFuture<TriggerOutcome> outcome = new CompletableFuture<>();
+        private volatile Instant completedAt;
+
+        private TriggerReceipt(String clusterId, String recurringJobId) {
+            this.clusterId = clusterId;
+            this.recurringJobId = recurringJobId;
+        }
+
+        private void complete(TriggerOutcome result) {
+            outcome.complete(result);
+            completedAt = Instant.now();
+        }
     }
 
     public List<SyncToolSpecification> specifications() {
@@ -191,9 +226,14 @@ public class OpsTools {
                                 {"type":"object","properties":{"job_id":{"type":"string","description":"The job id (a UUID)"}},"required":["job_id"]}""",
                         annotations(false, true, true), (account, args) -> deleteJob(account, jobId(args, "job_id"))),
                 tool("trigger_recurring_job", "Trigger recurring job", """
-                                Run a recurring job now, outside its schedule. Needs a connector token with operate access.""",
+                                Run a recurring job now, outside its schedule. Needs a connector token with operate access. \
+                                For safe retries, pass a fresh request_id for each intended run and reuse that same ID only \
+                                when retrying an uncertain result. A request_id is remembered for 15 minutes.""",
                         """
-                                {"type":"object","properties":{"recurring_job_id":{"type":"string","description":"The recurring job id from list_recurring_jobs"}},"required":["recurring_job_id"]}""",
+                                {"type":"object","properties":{
+                                  "recurring_job_id":{"type":"string","description":"The recurring job id from list_recurring_jobs"},
+                                  "request_id":{"type":"string","minLength":8,"maxLength":128,"pattern":"^[A-Za-z0-9_-]+$","description":"Optional stable caller-generated ID (for example a UUID). Reuse only when retrying this trigger."}},
+                                 "required":["recurring_job_id"]}""",
                         annotations(false, true, false), this::triggerRecurringJob),
                 tool("dismiss_problem", "Dismiss problem", """
                                 Dismiss a problem shown in the dashboard, by its type from get_problems. Needs a connector token \
@@ -505,11 +545,71 @@ public class OpsTools {
         return Map.of("deleted", jobId);
     }
 
-    private Object triggerRecurringJob(Account account, Map<String, Object> args) {
+    Object triggerRecurringJob(Account account, Map<String, Object> args) {
         String id = string(args, "recurring_job_id");
         if (id == null || !RECURRING_JOB_ID.matcher(id).matches()) throw new ToolException("Not a recurring job id: " + id);
-        dashboard.execute(account, "POST", "/api/recurring-jobs/" + id + "/trigger");
-        return Map.of("triggered", id);
+        Object rawRequestId = args.get("request_id");
+        if (!args.containsKey("request_id")) {
+            dashboard.execute(account, "POST", "/api/recurring-jobs/" + id + "/trigger");
+            return Map.of("triggered", id);
+        }
+        if (!(rawRequestId instanceof String requestId) || !TRIGGER_REQUEST_ID.matcher(requestId).matches()) {
+            throw new ToolException("request_id must be 8–128 URL-safe letters, digits, underscores or hyphens.");
+        }
+
+        TriggerRequestKey key = new TriggerRequestKey(account.id(), requestId);
+        TriggerReceipt receipt;
+        boolean firstCall;
+        synchronized (triggerReceipts) {
+            expireTriggerReceiptsLocked(Instant.now());
+            receipt = triggerReceipts.get(key);
+            if (receipt == null) {
+                if (triggerReceipts.size() >= MAX_TRIGGER_RECEIPTS_GLOBAL ||
+                        triggerReceipts.keySet().stream().filter(k -> k.accountId().equals(account.id())).count() >= MAX_TRIGGER_RECEIPTS_PER_ACCOUNT) {
+                    throw new ToolException("Too many recent recurring-job triggers. Retry after older request_id receipts expire.");
+                }
+                receipt = new TriggerReceipt(account.clusterId(), id);
+                triggerReceipts.put(key, receipt);
+                firstCall = true;
+            } else {
+                if (!Objects.equals(receipt.clusterId, account.clusterId()) || !receipt.recurringJobId.equals(id)) {
+                    throw new ToolException("request_id was already used for a different cluster or recurring job. Use a new request_id for a new trigger.");
+                }
+                firstCall = false;
+            }
+        }
+
+        if (!firstCall) return replayTrigger(receipt);
+        try {
+            dashboard.execute(account, "POST", "/api/recurring-jobs/" + id + "/trigger");
+            Object result = Map.of("triggered", id);
+            receipt.complete(new TriggerOutcome(result, null));
+            return result;
+        } catch (RuntimeException failure) {
+            // A timeout may mean the connector completed the trigger but its answer was lost. Cache it too.
+            receipt.complete(new TriggerOutcome(null, failure));
+            throw failure;
+        } catch (Error failure) {
+            receipt.complete(new TriggerOutcome(null, new ToolException(
+                    "Trigger outcome is unknown. Retry with this same request_id; do not use a new one unless another run is intended.")));
+            throw failure;
+        }
+    }
+
+    private Object replayTrigger(TriggerReceipt receipt) {
+        TriggerOutcome outcome;
+        try {
+            outcome = receipt.outcome.get(TRIGGER_REPLAY_WAIT.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            throw new ToolException("This trigger is still in progress or its outcome is unknown. Retry with the same request_id later.");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new ToolException("This trigger is still in progress. Retry with the same request_id later.");
+        } catch (ExecutionException e) {
+            throw new ToolException("Trigger outcome is unknown. Retry with the same request_id later.");
+        }
+        if (outcome.failure() != null) throw outcome.failure();
+        return outcome.value();
     }
 
     private Object dismissProblem(Account account, Map<String, Object> args) {
@@ -535,6 +635,23 @@ public class OpsTools {
     @Scheduled(fixedDelay = 60_000)
     public void expirePreviews() {
         previews.values().removeIf(p -> p.createdAt.isBefore(Instant.now().minus(PREVIEW_TTL)));
+    }
+
+    @Scheduled(fixedDelay = 60_000)
+    public void expireTriggerReceipts() {
+        expireTriggerReceipts(Instant.now());
+    }
+
+    void expireTriggerReceipts(Instant now) {
+        synchronized (triggerReceipts) {
+            expireTriggerReceiptsLocked(now);
+        }
+    }
+
+    private void expireTriggerReceiptsLocked(Instant now) {
+        Instant cutoff = now.minus(TRIGGER_RECEIPT_TTL);
+        // Keep in-flight receipts: an uncertain response must not allow a concurrent second trigger.
+        triggerReceipts.values().removeIf(receipt -> receipt.completedAt != null && receipt.completedAt.isBefore(cutoff));
     }
 
     // ------------------------------------------------------------------ plumbing
