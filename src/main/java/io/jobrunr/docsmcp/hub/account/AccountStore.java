@@ -10,7 +10,9 @@ import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -21,6 +23,7 @@ public class AccountStore {
 
     public static final String KIND_CONNECTOR = "connector";
     public static final String KIND_AGENT = "agent";
+    public static final int MAX_DISCONNECTED_SNAPSHOTS = 32;
 
     private final JdbcClient jdbc;
 
@@ -35,15 +38,20 @@ public class AccountStore {
     }
 
     public Optional<Account> findByEmail(String email) {
-        return jdbc.sql("SELECT * FROM hub_accounts WHERE email = ?").param(email.toLowerCase()).query(AccountStore::account).optional();
+        return jdbc.sql("SELECT * FROM hub_accounts WHERE email = ?").param(email.toLowerCase(Locale.ROOT)).query(AccountStore::account).optional();
     }
 
     public Account create(String email, String name, String company, String role, String useCase) {
         String id = UUID.randomUUID().toString();
         jdbc.sql("INSERT INTO hub_accounts (id, email, name, company, job_role, use_case, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-                .params(id, email.toLowerCase(), name, company, role, useCase, ts(Instant.now()))
+                .params(id, email.toLowerCase(Locale.ROOT), name, company, role, useCase, ts(Instant.now()))
                 .update();
         return findById(id).orElseThrow();
+    }
+
+    /** Server-side provisioning only. There is intentionally no public endpoint for this flag. */
+    public void setProEnabled(String accountId, boolean enabled) {
+        jdbc.sql("UPDATE hub_accounts SET is_pro = ? WHERE id = ?").params(enabled, accountId).update();
     }
 
     /** @return true if this call verified the account, false if it was verified before */
@@ -53,8 +61,16 @@ public class AccountStore {
                 .update() == 1;
     }
 
-    public void linkCluster(String accountId, String clusterId) {
-        jdbc.sql("UPDATE hub_accounts SET cluster_id = ? WHERE id = ?").params(clusterId, accountId).update();
+    /** Atomically claims the default cluster; concurrent first connections cannot overwrite one another. */
+    public boolean claimClusterIfUnlinked(String accountId, String clusterId) {
+        return jdbc.sql("UPDATE hub_accounts SET cluster_id = ? WHERE id = ? AND cluster_id IS NULL")
+                .params(clusterId, accountId).update() == 1;
+    }
+
+    /** Atomically moves an OSS account after its previously linked cluster went away. */
+    public boolean moveClusterIfCurrent(String accountId, String previousClusterId, String nextClusterId) {
+        return jdbc.sql("UPDATE hub_accounts SET cluster_id = ? WHERE id = ? AND cluster_id = ?")
+                .params(nextClusterId, accountId, previousClusterId).update() == 1;
     }
 
     // ------------------------------------------------------------------ magic links and sessions
@@ -110,12 +126,21 @@ public class AccountStore {
     /** Revokes the current tokens of the account and issues a new connector and agent token. */
     @Transactional
     public IssuedTokens issueTokens(String accountId, boolean operate) {
+        // Serialize replacement for this account across concurrent HTTP requests and replicas.
+        jdbc.sql("SELECT id FROM hub_accounts WHERE id = ? FOR UPDATE")
+                .param(accountId).query(String.class).optional()
+                .orElseThrow(() -> new IllegalArgumentException("Unknown account: " + accountId));
         Instant now = Instant.now();
         jdbc.sql("UPDATE hub_tokens SET revoked_at = ? WHERE account_id = ? AND revoked_at IS NULL").params(ts(now), accountId).update();
+        jdbc.sql("DELETE FROM hub_current_tokens WHERE account_id = ?").param(accountId).update();
         String connectorToken = Tokens.connectorToken(operate);
         String agentToken = Tokens.agentToken();
         insertToken(accountId, KIND_CONNECTOR, operate ? "operate" : "read", connectorToken, now);
         insertToken(accountId, KIND_AGENT, null, agentToken, now);
+        jdbc.sql("INSERT INTO hub_current_tokens (account_id, kind, token_hash) VALUES (?, ?, ?)")
+                .params(accountId, KIND_CONNECTOR, Tokens.hash(connectorToken)).update();
+        jdbc.sql("INSERT INTO hub_current_tokens (account_id, kind, token_hash) VALUES (?, ?, ?)")
+                .params(accountId, KIND_AGENT, Tokens.hash(agentToken)).update();
         return new IssuedTokens(connectorToken, agentToken);
     }
 
@@ -126,14 +151,22 @@ public class AccountStore {
     }
 
     public Optional<TokenOwner> findActiveToken(String token, String kind) {
-        return jdbc.sql("SELECT account_id, scope FROM hub_tokens WHERE token_hash = ? AND kind = ? AND revoked_at IS NULL")
+        return jdbc.sql("""
+                        SELECT t.account_id, t.scope FROM hub_tokens t
+                        JOIN hub_current_tokens slot ON slot.token_hash = t.token_hash
+                        WHERE t.token_hash = ? AND t.kind = ? AND t.revoked_at IS NULL
+                        """)
                 .params(Tokens.hash(token), kind)
                 .query((rs, i) -> new TokenOwner(rs.getString("account_id"), rs.getString("scope")))
                 .optional();
     }
 
     public List<TokenInfo> activeTokens(String accountId) {
-        return jdbc.sql("SELECT kind, scope, hint, created_at FROM hub_tokens WHERE account_id = ? AND revoked_at IS NULL ORDER BY kind")
+        return jdbc.sql("""
+                        SELECT t.kind, t.scope, t.hint, t.created_at FROM hub_tokens t
+                        JOIN hub_current_tokens slot ON slot.token_hash = t.token_hash
+                        WHERE t.account_id = ? AND t.revoked_at IS NULL ORDER BY t.kind
+                        """)
                 .param(accountId)
                 .query((rs, i) -> new TokenInfo(rs.getString("kind"), rs.getString("scope"), rs.getString("hint"), instant(rs, "created_at")))
                 .list();
@@ -148,20 +181,36 @@ public class AccountStore {
             Instant firstConnectedAt, Instant snapshotAt) {
     }
 
-    /** @return true if this is the first snapshot ever stored for the account */
+    /** A Pro account that connected an extra cluster keeps its original default pinned after downgrade. */
+    public void markProMultiClusterSeen(String accountId) {
+        jdbc.sql("UPDATE hub_accounts SET pro_multi_cluster_seen = TRUE WHERE id = ? AND pro_multi_cluster_seen = FALSE")
+                .param(accountId).update();
+    }
+
+    public boolean hadProMultiCluster(String accountId) {
+        return jdbc.sql("SELECT pro_multi_cluster_seen FROM hub_accounts WHERE id = ?")
+                .param(accountId).query(Boolean.class).optional().orElse(false);
+    }
+
+    /** @return true if this is the first snapshot stored for this account and cluster */
+    @Transactional
     public boolean saveInstance(InstanceSnapshot s) {
+        if (s.clusterId() == null) throw new IllegalArgumentException("A snapshot needs a cluster id");
+        // Serialize the update-then-insert path for simultaneous nodes of one cluster.
+        jdbc.sql("SELECT id FROM hub_accounts WHERE id = ? FOR UPDATE").param(s.accountId())
+                .query(String.class).optional().orElseThrow();
         int updated = jdbc.sql("""
-                        UPDATE hub_instances SET cluster_id = ?, jobrunr_version = ?, java_version = ?, framework = ?, storage_provider = ?,
+                        UPDATE hub_cluster_snapshots SET jobrunr_version = ?, java_version = ?, framework = ?, storage_provider = ?,
                             redaction = ?, servers = ?, recurring_jobs = ?, jobs_scheduled = ?, jobs_enqueued = ?, jobs_processing = ?,
                             jobs_failed = ?, jobs_succeeded = ?, snapshot_at = ?
-                        WHERE account_id = ?""")
-                .params(s.clusterId(), s.jobrunrVersion(), s.javaVersion(), s.framework(), s.storageProvider(), s.redaction(), s.servers(),
+                        WHERE account_id = ? AND cluster_id = ?""")
+                .params(s.jobrunrVersion(), s.javaVersion(), s.framework(), s.storageProvider(), s.redaction(), s.servers(),
                         s.recurringJobs(), s.jobsScheduled(), s.jobsEnqueued(), s.jobsProcessing(), s.jobsFailed(), s.jobsSucceeded(),
-                        ts(s.snapshotAt()), s.accountId())
+                        ts(s.snapshotAt()), s.accountId(), s.clusterId())
                 .update();
         if (updated == 1) return false;
         jdbc.sql("""
-                        INSERT INTO hub_instances (account_id, cluster_id, jobrunr_version, java_version, framework, storage_provider, redaction,
+                        INSERT INTO hub_cluster_snapshots (account_id, cluster_id, jobrunr_version, java_version, framework, storage_provider, redaction,
                             servers, recurring_jobs, jobs_scheduled, jobs_enqueued, jobs_processing, jobs_failed, jobs_succeeded,
                             first_connected_at, snapshot_at)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""")
@@ -172,15 +221,38 @@ public class AccountStore {
         return true;
     }
 
-    public Optional<InstanceSnapshot> findInstance(String accountId) {
-        return jdbc.sql("SELECT * FROM hub_instances WHERE account_id = ?").param(accountId)
-                .query((rs, i) -> new InstanceSnapshot(
-                        rs.getString("account_id"), rs.getString("cluster_id"), rs.getString("jobrunr_version"), rs.getString("java_version"),
-                        rs.getString("framework"), rs.getString("storage_provider"), (Boolean) rs.getObject("redaction"),
-                        (Integer) rs.getObject("servers"), longOrNull(rs, "recurring_jobs"), longOrNull(rs, "jobs_scheduled"),
-                        longOrNull(rs, "jobs_enqueued"), longOrNull(rs, "jobs_processing"), longOrNull(rs, "jobs_failed"),
-                        longOrNull(rs, "jobs_succeeded"), instant(rs, "first_connected_at"), instant(rs, "snapshot_at")))
-                .optional();
+    public Optional<InstanceSnapshot> findInstance(String accountId, String clusterId) {
+        if (clusterId == null) return Optional.empty();
+        Optional<InstanceSnapshot> current = jdbc.sql("""
+                        SELECT * FROM hub_cluster_snapshots WHERE account_id = ? AND cluster_id = ?""")
+                .params(accountId, clusterId).query(AccountStore::instance).optional();
+        if (current.isPresent()) return current;
+        return jdbc.sql("SELECT * FROM hub_instances WHERE account_id = ? AND cluster_id = ?")
+                .params(accountId, clusterId).query(AccountStore::instance).optional();
+    }
+
+    public List<InstanceSnapshot> findInstances(String accountId) {
+        return jdbc.sql("SELECT * FROM hub_cluster_snapshots WHERE account_id = ? ORDER BY snapshot_at DESC")
+                .param(accountId).query(AccountStore::instance).list();
+    }
+
+    /** Keep every connected cluster plus the default, but only recent disconnected history. */
+    @Transactional
+    public int pruneDisconnectedSnapshots(String accountId, Set<String> connectedClusterIds) {
+        jdbc.sql("SELECT id FROM hub_accounts WHERE id = ? FOR UPDATE")
+                .param(accountId).query(String.class).optional().orElseThrow();
+        String defaultClusterId = findById(accountId).orElseThrow().clusterId();
+        List<String> ids = jdbc.sql("SELECT cluster_id FROM hub_cluster_snapshots WHERE account_id = ? ORDER BY snapshot_at DESC, cluster_id")
+                .param(accountId).query(String.class).list();
+        int disconnected = 0;
+        int removed = 0;
+        for (String id : ids) {
+            if (id.equals(defaultClusterId) || connectedClusterIds.contains(id)) continue;
+            if (++disconnected <= MAX_DISCONNECTED_SNAPSHOTS) continue;
+            removed += jdbc.sql("DELETE FROM hub_cluster_snapshots WHERE account_id = ? AND cluster_id = ?")
+                    .params(accountId, id).update();
+        }
+        return removed;
     }
 
     // ------------------------------------------------------------------ usage and lead events
@@ -217,7 +289,16 @@ public class AccountStore {
     private static Account account(ResultSet rs, int rowNum) throws SQLException {
         return new Account(rs.getString("id"), rs.getString("email"), rs.getString("name"), rs.getString("company"),
                 rs.getString("job_role"), rs.getString("use_case"), rs.getString("cluster_id"),
-                instant(rs, "created_at"), instant(rs, "verified_at"));
+                instant(rs, "created_at"), instant(rs, "verified_at"), rs.getBoolean("is_pro"));
+    }
+
+    private static InstanceSnapshot instance(ResultSet rs, int rowNum) throws SQLException {
+        return new InstanceSnapshot(
+                rs.getString("account_id"), rs.getString("cluster_id"), rs.getString("jobrunr_version"), rs.getString("java_version"),
+                rs.getString("framework"), rs.getString("storage_provider"), (Boolean) rs.getObject("redaction"),
+                (Integer) rs.getObject("servers"), longOrNull(rs, "recurring_jobs"), longOrNull(rs, "jobs_scheduled"),
+                longOrNull(rs, "jobs_enqueued"), longOrNull(rs, "jobs_processing"), longOrNull(rs, "jobs_failed"),
+                longOrNull(rs, "jobs_succeeded"), instant(rs, "first_connected_at"), instant(rs, "snapshot_at"));
     }
 
     private static Timestamp ts(Instant instant) {

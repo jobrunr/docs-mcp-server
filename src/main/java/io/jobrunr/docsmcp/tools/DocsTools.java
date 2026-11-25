@@ -17,6 +17,7 @@ public class DocsTools {
 
     private static final int DEFAULT_LIMIT = 10;
     private static final int MAX_LIMIT = 25;
+    private static final int MAX_QUERY_LENGTH = 1024;
 
     private final HybridSearch hybridSearch;
     private final DocsRegistry registry;
@@ -35,10 +36,13 @@ public class DocsTools {
                     fetch_jobrunr_doc when the snippet isn't enough.
                     """)
     public SearchResponse searchJobrunrDocs(
-            @ToolParam(description = "Natural-language or keyword query. Examples: 'recurring jobs', 'how to retry failed jobs', 'spring boot configuration'.") String query,
+            @ToolParam(description = "Natural-language or keyword query, at most 1024 characters. Examples: 'recurring jobs', 'how to retry failed jobs'.") String query,
             @ToolParam(required = false, description = "Max results (default 10, max 25).") Integer limit) {
         if (query == null || query.isBlank()) {
             return new SearchResponse(query, List.of(), null);
+        }
+        if (query.length() > MAX_QUERY_LENGTH) {
+            throw new IllegalArgumentException("Search query must be at most " + MAX_QUERY_LENGTH + " characters");
         }
         int n = limit == null ? DEFAULT_LIMIT : Math.min(Math.max(limit, 1), MAX_LIMIT);
         List<SearchHit> hits = hybridSearch.search(query, n);

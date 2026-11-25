@@ -3,6 +3,8 @@ package io.jobrunr.docsmcp.hub.account;
 import io.jobrunr.docsmcp.hub.HubProperties;
 import io.jobrunr.docsmcp.hub.connector.ConnectorHub;
 import io.jobrunr.docsmcp.hub.connector.InstanceMonitor;
+import io.jobrunr.docsmcp.hub.mcp.OpsMcpServerConfig;
+import io.jobrunr.docsmcp.hub.mcp.OpsSessionQuotaWebFilter;
 import io.jobrunr.docsmcp.hub.leads.LeadEvents;
 import io.jobrunr.docsmcp.web.ClientIpExtractor;
 import org.slf4j.Logger;
@@ -18,14 +20,16 @@ import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
+import java.net.URI;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.Callable;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 
 /**
@@ -41,22 +45,29 @@ public class AccountController {
     private static final Pattern EMAIL = Pattern.compile("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$");
     private static final Duration EMAIL_COOLDOWN = Duration.ofSeconds(60);
     private static final int MAX_LINKS_PER_IP_PER_HOUR = 10;
+    private static final int MAX_RATE_LIMIT_KEYS = 10_000;
 
     private final AccountStore store;
     private final Mailer mailer;
     private final LeadEvents leadEvents;
     private final ConnectorHub hub;
     private final InstanceMonitor monitor;
+    private final OpsMcpServerConfig.OpsMcpEndpoint opsEndpoint;
+    private final OpsSessionQuotaWebFilter sessionQuota;
     private final HubProperties properties;
-    private final Map<String, Instant> lastLinkPerEmail = new ConcurrentHashMap<>();
-    private final Map<String, List<Instant>> linksPerIp = new ConcurrentHashMap<>();
+    private final Map<String, Instant> lastLinkPerEmail = boundedMap(MAX_RATE_LIMIT_KEYS);
+    private final Map<String, List<Instant>> linksPerIp = boundedMap(MAX_RATE_LIMIT_KEYS);
 
-    public AccountController(AccountStore store, Mailer mailer, LeadEvents leadEvents, ConnectorHub hub, InstanceMonitor monitor, HubProperties properties) {
+    public AccountController(AccountStore store, Mailer mailer, LeadEvents leadEvents, ConnectorHub hub, InstanceMonitor monitor,
+                             OpsMcpServerConfig.OpsMcpEndpoint opsEndpoint, OpsSessionQuotaWebFilter sessionQuota,
+                             HubProperties properties) {
         this.store = store;
         this.mailer = mailer;
         this.leadEvents = leadEvents;
         this.hub = hub;
         this.monitor = monitor;
+        this.opsEndpoint = opsEndpoint;
+        this.sessionQuota = sessionQuota;
         this.properties = properties;
     }
 
@@ -100,7 +111,13 @@ public class AccountController {
             // same answer whether or not the account exists, so the form cannot be used to probe for accounts
             return store.findByEmail(email)
                     .map(account -> sendLink(account, account.verifiedAt() == null))
-                    .orElseGet(() -> ResponseEntity.ok(Map.of("status", "check-your-inbox")));
+                    .orElseGet(() -> {
+                        // Keep the HTTP answer indistinguishable, but leave a domain-only clue for operators
+                        // when a deployment lost its account database.
+                        log.debug("Sign-in link not sent: no account found at domain {}. Check HUB_DB_URL and /app/data persistence if this is a known user.",
+                                email.substring(email.lastIndexOf('@') + 1));
+                        return ResponseEntity.ok(Map.of("status", "check-your-inbox"));
+                    });
         });
     }
 
@@ -116,9 +133,12 @@ public class AccountController {
                 leadEvents.record(account.get(), LeadEvents.VERIFIED, account.get().useCase(), ClientIpExtractor.from(exchange.getRequest()));
             }
             String session = store.createSession(account.get().id(), properties.sessionTtl());
+            // This user proved mailbox access. A just-verified signup can sign in again
+            // immediately after signing out without hitting the preceding signup cooldown.
+            releaseLinkCooldown(account.get().email());
             exchange.getResponse().addCookie(ResponseCookie.from(SESSION_COOKIE, session)
                     .httpOnly(true)
-                    .secure(isHttps(exchange))
+                    .secure(secureCookie())
                     .sameSite("Lax")
                     .path("/")
                     .maxAge(properties.sessionTtl())
@@ -132,7 +152,8 @@ public class AccountController {
         var cookie = exchange.getRequest().getCookies().getFirst(SESSION_COOKIE);
         return blocking(() -> {
             if (cookie != null) store.deleteSession(cookie.getValue());
-            exchange.getResponse().addCookie(ResponseCookie.from(SESSION_COOKIE, "").path("/").maxAge(0).build());
+            exchange.getResponse().addCookie(ResponseCookie.from(SESSION_COOKIE, "")
+                    .httpOnly(true).secure(secureCookie()).sameSite("Lax").path("/").maxAge(0).build());
             return ResponseEntity.noContent().build();
         });
     }
@@ -144,10 +165,16 @@ public class AccountController {
             body.put("name", account.name());
             body.put("email", account.email());
             body.put("company", account.company());
+            body.put("proEnabled", account.proEnabled());
             body.put("publicUrl", properties.publicUrl());
             body.put("tokens", store.activeTokens(account.id()));
-            body.put("nodes", hub.onlineNodes(account.id()).stream().map(node -> {
+            List<ConnectorHub.Node> visibleNodes = hub.onlineNodes(account.id()).stream()
+                    .filter(ConnectorHub.Node::isReady)
+                    .filter(node -> account.proEnabled() || account.clusterId() == null || account.clusterId().equals(node.clusterId()))
+                    .toList();
+            body.put("nodes", visibleNodes.stream().map(node -> {
                 Map<String, Object> n = new LinkedHashMap<>();
+                n.put("clusterId", node.clusterId());
                 n.put("jobrunrVersion", node.info().jobrunrVersion());
                 n.put("javaVersion", node.info().javaVersion());
                 n.put("framework", node.info().framework());
@@ -156,7 +183,16 @@ public class AccountController {
                 n.put("lastSeenAt", node.lastPollAt());
                 return n;
             }).toList());
-            body.put("instance", store.findInstance(account.id()).orElse(null));
+            store.pruneDisconnectedSnapshots(account.id(), Set.copyOf(visibleNodes.stream()
+                    .map(ConnectorHub.Node::clusterId).toList()));
+            List<AccountStore.InstanceSnapshot> instances = store.findInstances(account.id());
+            if (!account.proEnabled()) {
+                instances = instances.stream()
+                        .filter(snapshot -> account.clusterId() != null && account.clusterId().equals(snapshot.clusterId()))
+                        .toList();
+            }
+            body.put("instances", instances);
+            body.put("instance", store.findInstance(account.id(), account.clusterId()).orElse(null));
             monitor.refreshSoon(account.id());
             body.put("recentToolCalls", store.recentToolCalls(account.id(), 15));
             return ResponseEntity.ok(body);
@@ -168,6 +204,15 @@ public class AccountController {
         return withAccount(exchange, account -> {
             AccountStore.IssuedTokens tokens = store.issueTokens(account.id(), request.operate());
             hub.disconnectAccount(account.id());
+            sessionQuota.revokeAccountSessions(account.id(), sessionId -> {
+                try {
+                    opsEndpoint.deleteSession(exchange, account, sessionId);
+                    return true;
+                } catch (RuntimeException e) {
+                    log.warn("Could not close a revoked MCP session for account {}: {}", account.id(), e.toString());
+                    return false;
+                }
+            });
             return ResponseEntity.ok(Map.<String, Object>of(
                     "connectorToken", tokens.connectorToken(),
                     "agentToken", tokens.agentToken(),
@@ -199,25 +244,41 @@ public class AccountController {
         return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(Map.of("error", "This server cannot send email yet, so signups are paused. Please try again later."));
     }
 
-    private boolean allowLink(String email, ServerWebExchange exchange) {
+    private synchronized boolean allowLink(String email, ServerWebExchange exchange) {
         Instant now = Instant.now();
-        Instant last = lastLinkPerEmail.get(email.toLowerCase());
+        String normalizedEmail = email.toLowerCase(Locale.ROOT);
+        Instant last = lastLinkPerEmail.get(normalizedEmail);
         if (last != null && last.isAfter(now.minus(EMAIL_COOLDOWN))) return false;
 
         String ip = String.valueOf(ClientIpExtractor.from(exchange.getRequest()));
-        List<Instant> recent = linksPerIp.compute(ip, (key, list) -> {
-            List<Instant> kept = list == null ? new java.util.ArrayList<>() : new java.util.ArrayList<>(list.stream().filter(t -> t.isAfter(now.minus(Duration.ofHours(1)))).toList());
-            kept.add(now);
-            return kept;
-        });
-        if (recent.size() > MAX_LINKS_PER_IP_PER_HOUR) return false;
-        lastLinkPerEmail.put(email.toLowerCase(), now);
+        List<Instant> previous = linksPerIp.get(ip);
+        List<Instant> recent = previous == null ? new java.util.ArrayList<>()
+                : new java.util.ArrayList<>(previous.stream().filter(t -> t.isAfter(now.minus(Duration.ofHours(1)))).toList());
+        if (recent.size() >= MAX_LINKS_PER_IP_PER_HOUR) {
+            linksPerIp.put(ip, recent);
+            return false;
+        }
+        recent.add(now);
+        linksPerIp.put(ip, recent);
+        lastLinkPerEmail.put(normalizedEmail, now);
         return true;
     }
 
-    private static boolean isHttps(ServerWebExchange exchange) {
-        String forwardedProto = exchange.getRequest().getHeaders().getFirst("X-Forwarded-Proto");
-        return "https".equalsIgnoreCase(forwardedProto) || "https".equalsIgnoreCase(exchange.getRequest().getURI().getScheme());
+    private synchronized void releaseLinkCooldown(String email) {
+        lastLinkPerEmail.remove(email.toLowerCase(Locale.ROOT));
+    }
+
+    private boolean secureCookie() {
+        return "https".equalsIgnoreCase(URI.create(properties.publicUrl()).getScheme());
+    }
+
+    private static <V> Map<String, V> boundedMap(int maximumSize) {
+        return new LinkedHashMap<>(128, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, V> eldest) {
+                return size() > maximumSize;
+            }
+        };
     }
 
     private static <T> Mono<T> blocking(Callable<T> callable) {
@@ -229,7 +290,7 @@ public class AccountController {
     }
 
     private static ResponseEntity<Map<String, Object>> tooManyRequests() {
-        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(Map.of("error", "We just sent you a link. Check your inbox, or try again in a minute."));
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(Map.of("error", "Too many link requests. Check your inbox, or try again later."));
     }
 
     private static String trim(String value, int max) {

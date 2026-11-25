@@ -32,12 +32,22 @@ public class LeadEvents {
     public static final String SECOND_CLUSTER_ATTEMPT = "second_cluster_attempt";
 
     private static final Logger log = LoggerFactory.getLogger(LeadEvents.class);
+    private static final Duration REPEAT_EVENT_COOLDOWN = Duration.ofHours(1);
+    private static final int MAX_EVENT_KEYS = 10_000;
 
     private final AccountStore store;
     private final QueryLogClient queryLogClient;
     private final String serverVersion;
     private final WebClient webClient = WebClient.builder().build();
     private final String webhookUrl;
+    private final Map<EventKey, Instant> lastRepeatEvent = new LinkedHashMap<>(128, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<EventKey, Instant> eldest) {
+            return size() > MAX_EVENT_KEYS;
+        }
+    };
+
+    private record EventKey(String accountId, String event, String detail) {}
 
     public LeadEvents(AccountStore store, HubProperties properties, QueryLogClient queryLogClient,
                       @Value("${spring.ai.mcp.server.version:unknown}") String serverVersion) {
@@ -53,7 +63,14 @@ public class LeadEvents {
 
     /** @param clientIp the browser or agent that caused the event, when there is one; never the user's application */
     public void record(Account account, String event, String detail, String clientIp) {
-        store.recordLeadEvent(account.id(), event, detail);
+        EventKey repeatKey = repeatKey(account.id(), event, detail);
+        if (repeatKey != null && !reserveRepeatEvent(repeatKey)) return;
+        try {
+            store.recordLeadEvent(account.id(), event, detail);
+        } catch (RuntimeException e) {
+            if (repeatKey != null) releaseRepeatEvent(repeatKey);
+            throw e;
+        }
         log.info("Lead event {} for {} ({})", event, account.emailDomain(), detail);
         logToAttribution(account, event, detail, clientIp);
         if (webhookUrl == null || webhookUrl.isBlank()) return;
@@ -75,6 +92,24 @@ public class LeadEvents {
                 .onErrorResume(e -> Mono.empty())
                 .subscribeOn(Schedulers.boundedElastic())
                 .subscribe();
+    }
+
+    private static EventKey repeatKey(String accountId, String event, String detail) {
+        if (SECOND_CLUSTER_ATTEMPT.equals(event)) return new EventKey(accountId, event, null);
+        if (PRO_FEATURE_ATTEMPT.equals(event)) return new EventKey(accountId, event, detail);
+        return null;
+    }
+
+    private synchronized boolean reserveRepeatEvent(EventKey key) {
+        Instant now = Instant.now();
+        Instant last = lastRepeatEvent.get(key);
+        if (last != null && last.isAfter(now.minus(REPEAT_EVENT_COOLDOWN))) return false;
+        lastRepeatEvent.put(key, now);
+        return true;
+    }
+
+    private synchronized void releaseRepeatEvent(EventKey key) {
+        lastRepeatEvent.remove(key);
     }
 
     private void logToAttribution(Account account, String event, String detail, String clientIp) {

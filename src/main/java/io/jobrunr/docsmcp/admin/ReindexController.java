@@ -17,6 +17,9 @@ import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @RestController
 @RequestMapping("/admin")
@@ -24,9 +27,12 @@ public class ReindexController {
 
     private static final Logger log = LoggerFactory.getLogger(ReindexController.class);
     private static final long CLOCK_SKEW_SECONDS = 300;
+    private static final int MAX_USED_SIGNATURES = 10_000;
 
     private final DocsLoader loader;
     private final String secret;
+    private final Map<String, Long> usedSignatures = new ConcurrentHashMap<>();
+    private final AtomicBoolean reindexRunning = new AtomicBoolean();
 
     public ReindexController(DocsLoader loader, @Value("${docs.reindex-secret:}") String secret) {
         this.loader = loader;
@@ -51,12 +57,27 @@ public class ReindexController {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("bad timestamp");
         }
         long now = System.currentTimeMillis() / 1000;
-        if (Math.abs(now - ts) > CLOCK_SKEW_SECONDS) {
+        if (ts < now - CLOCK_SKEW_SECONDS || ts > now + CLOCK_SKEW_SECONDS) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("timestamp out of window");
         }
         String expected = hmacHex(timestamp, secret);
         if (!constantTimeEquals(expected, signature)) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("bad signature");
+        }
+        // The signed timestamp is a one-use event key for its entire validity window.
+        // This preserves existing webhook signing while making captured requests non-replayable.
+        synchronized (usedSignatures) {
+            usedSignatures.entrySet().removeIf(entry -> entry.getValue() < now);
+            if (usedSignatures.containsKey(signature)) {
+                return ResponseEntity.status(HttpStatus.CONFLICT).body("signature already used");
+            }
+            if (usedSignatures.size() >= MAX_USED_SIGNATURES) {
+                return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body("too many reindex requests");
+            }
+            usedSignatures.put(signature, ts + CLOCK_SKEW_SECONDS);
+        }
+        if (!reindexRunning.compareAndSet(false, true)) {
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body("reindex already running");
         }
         Mono.fromRunnable(() -> {
                     try {
@@ -66,6 +87,7 @@ public class ReindexController {
                     }
                 })
                 .subscribeOn(Schedulers.boundedElastic())
+                .doFinally(signal -> reindexRunning.set(false))
                 .subscribe();
         return ResponseEntity.accepted().body("reindex started");
     }

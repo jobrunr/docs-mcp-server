@@ -60,6 +60,13 @@ class DocsToolsTest {
     }
 
     @Test
+    void oversizedSearchQueryIsRejectedBeforeEmbedding() {
+        assertThatThrownBy(() -> tools.searchJobrunrDocs("a".repeat(1025), 5))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("at most 1024");
+    }
+
+    @Test
     void searchAttachesProTrialHintWhenProResultsPresent() {
         DocsTools.SearchResponse resp = tools.searchJobrunrDocs("priority queues", 5);
         assertThat(resp.results()).isNotEmpty();
