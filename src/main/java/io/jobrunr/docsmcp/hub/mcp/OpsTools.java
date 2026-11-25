@@ -68,7 +68,7 @@ public class OpsTools {
     private static final int MAX_HISTORY = 10;
     private static final Duration PREVIEW_TTL = Duration.ofMinutes(15);
     static final Duration TRIGGER_RECEIPT_TTL = Duration.ofMinutes(15);
-    private static final Duration TRIGGER_REPLAY_WAIT = Duration.ofMinutes(2).plusSeconds(5);
+    private static final Duration TRIGGER_REPLAY_WAIT = Duration.ofSeconds(30);
     private static final List<String> STATES = List.of("AWAITING", "SCHEDULED", "ENQUEUED", "PROCESSING", "FAILED", "SUCCEEDED", "DELETED");
     private static final List<String> OVERVIEW_STATES = List.of("SCHEDULED", "ENQUEUED", "PROCESSING", "FAILED", "SUCCEEDED");
     private static final Set<String> REQUEUEABLE_STATES = Set.of("FAILED", "SUCCEEDED", "DELETED", "SCHEDULED");
@@ -693,7 +693,10 @@ public class OpsTools {
         CallToolResult answer = null;
         try {
             result = handler.handle(selectCluster(a, name, arguments), arguments);
-            return answer = CallToolResult.builder().addTextContent(objectMapper.writeValueAsString(result)).isError(false).build();
+            Object labeledResult = CustomerDataNotice.label(name, result, objectMapper);
+            var response = CallToolResult.builder().addTextContent(objectMapper.writeValueAsString(labeledResult));
+            if (CustomerDataNotice.needsSeparateNotice(name, result)) response.addTextContent(CustomerDataNotice.WARNING);
+            return answer = response.isError(false).build();
         } catch (ToolException e) {
             return answer = error(e.getMessage());
         } catch (ConnectorHub.NoInstanceConnectedException e) {
