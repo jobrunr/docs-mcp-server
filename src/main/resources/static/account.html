@@ -6,7 +6,7 @@
   <title>JobRunr MCP · Your account</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Poppins:wght@600;700;800&family=Ubuntu+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%2306121e' stroke='%238b5cf6' stroke-width='3'/%3E%3Ccircle cx='16' cy='16' r='6' fill='%232ee6a6'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/hub.css">
 </head>
@@ -14,7 +14,7 @@
 <div class="glow"></div>
 <div class="wrap" style="max-width:920px">
   <header class="top">
-    <a class="brand" href="/account"><img src="/jobrunr-logo.png" alt="JobRunr"><span class="pill">MCP</span></a>
+    <a class="brand" href="/account"><img src="/jobrunr-logo.svg" alt="JobRunr"><span class="pill">MCP</span></a>
     <span><span class="muted who" id="who"></span> <button class="btn secondary small" id="signout" type="button">Sign out</button></span>
   </header>
 
@@ -66,9 +66,9 @@
     <div class="codebox" data-panel="build:maven"><pre id="install-maven">&lt;dependency&gt;
     &lt;groupId&gt;org.jobrunr&lt;/groupId&gt;
     &lt;artifactId&gt;jobrunr-mcp&lt;/artifactId&gt;
-    &lt;version&gt;1.0.0-beta.0&lt;/version&gt;
+    &lt;version&gt;1.0.0-beta.1&lt;/version&gt;
 &lt;/dependency&gt;</pre><button class="btn secondary small copy" type="button" data-copy="install-maven">Copy</button></div>
-    <div class="codebox hidden" data-panel="build:gradle"><pre id="install-gradle">implementation("org.jobrunr:jobrunr-mcp:1.0.0-beta.0")</pre><button class="btn secondary small copy" type="button" data-copy="install-gradle">Copy</button></div>
+    <div class="codebox hidden" data-panel="build:gradle"><pre id="install-gradle">implementation("org.jobrunr:jobrunr-mcp:1.0.0-beta.1")</pre><button class="btn secondary small copy" type="button" data-copy="install-gradle">Copy</button></div>
     <p class="muted" style="margin-top:18px">Then give it your connector token. The JobRunr dashboard does not have to run.</p>
     <div class="tabs" role="tablist" data-group="app">
       <button class="tab" role="tab" aria-selected="true" data-tab="spring">Spring Boot</button>

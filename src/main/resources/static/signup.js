@@ -93,5 +93,11 @@
   $("show-signin").addEventListener("click", () => show("signin-view"));
   $("show-signup").addEventListener("click", () => show("signup-view"));
   $("try-again").addEventListener("click", () => show(lastFlow === "signin" ? "signin-view" : "signup-view"));
-  if (location.hash === "#signin") show("signin-view");
+  function showSigninFromHash() {
+    if (location.hash !== "#signin") return;
+    show("signin-view");
+    $("get-tokens").scrollIntoView({ block: "start" });
+  }
+  window.addEventListener("hashchange", showSigninFromHash);
+  showSigninFromHash();
 })();
